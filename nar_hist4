@@ -1,5 +1,28 @@
 
 
+python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection\cesmlc_v4_problem_focused_source_history.py" `
+  --input "C:\Temp\enmt_cesmlc_lte_audit_p_akr3aesme01_30d.csv" `
+  --days 30 `
+  --out-dir "C:\Temp\cesmlc_v4_problem_focused_akr3aesme01_30d_outputs" `
+  --include-features "PHYSICALCELLID,CELLNAME,CELLTYPE,ANTENNALAT,ANTENNALON,ANTENNAORIENTATION,ANTENNAOPENING,ANTENNAHORIZONTALRANGE,ANTENNABASEALTITUDE,GEOTYPE,RADIUS1,SRVNGAREAAVERAGEALT,SRVNGAREAAVGALTUNCERT,SUPPORTEDTECHNOLOGIES" `
+  --defaults-json "C:\Temp\cesmlc_v4_feature_rules_template.json" `
+  --latlon-decimals 5 `
+  --memory-limit 6GB `
+  --threads 1 `
+  --feature-batch-size 1 `
+  --duckdb-temp-dir "C:\Temp\duckdb_spill_v4"
+
+python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection\cesmlc_v4_problem_focused_source_history.py" `
+  --input "C:\Temp\enmt_cesmlc_lte_audit_p_akr3aesme01_30d.csv" `
+  --days 30 `
+  --out-dir "C:\Temp\cesmlc_v4_problem_focused_akr3aesme01_30d_outputs" `
+  --include-features "PHYSICALCELLID,CELLNAME,CELLTYPE,ANTENNALAT,ANTENNALON,ANTENNAORIENTATION,ANTENNAOPENING,ANTENNAHORIZONTALRANGE,ANTENNABASEALTITUDE,GEOTYPE,RADIUS1,SRVNGAREAAVERAGEALT,SRVNGAREAAVGALTUNCERT,SUPPORTEDTECHNOLOGIES" `
+  --latlon-decimals 5 `
+  --memory-limit 6GB `
+  --threads 1 `
+  --feature-batch-size 1 `
+  --duckdb-temp-dir "C:\Temp\duckdb_spill_v4"
+
 
 
 #!/usr/bin/env python
