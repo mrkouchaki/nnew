@@ -1,0 +1,979 @@
+
+python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection\cesmlc_v6_train_problem_state_model.py" `
+  --dataset "C:\Temp\cesmlc_v6_seed_akr3aesme01_30d_outputs\cesmlc_v6_problem_state_training_dataset.csv" `
+  --out-dir "C:\Temp\cesmlc_v6_ml_akr3aesme01_30d_outputs" `
+  --model auto `
+  --test-size 0.25 `
+  --eval-size 0.20 `
+  --min-class-count 20 `
+  --train-verbose 25
+
+
+
+
+#!/usr/bin/env python
+"""
+CESMLC V6 - Problem-state weak/semi-supervised ML trainer
+==========================================================
+
+Purpose
+-------
+Train and evaluate a real multiclass problem-state model from the V6 seed-label
+training dataset produced by `cesmlc_v6_seed_label_dataset_builder.py`.
+
+Design
+------
+- Seed labels are high-precision weak labels, not treated as perfect truth.
+- Manual labels, if provided, override seed labels and receive higher weight.
+- The model is trained on problem-state feature engineering, not on the final
+  seed-label column itself.
+- By default, direct seed-rule indicator columns are excluded from the ML feature
+  set to avoid simply memorizing the seed-rule decision tree.
+- Optional pseudo-labeling can add high-confidence predictions from hold/unlabeled
+  rows and retrain, giving a semi-supervised workflow.
+
+Supported backends
+------------------
+--model auto       : CatBoost -> LightGBM -> sklearn RandomForest fallback
+--model catboost   : CatBoost multiclass classifier
+--model lightgbm   : LightGBM multiclass classifier
+--model sklearn_rf : sklearn RandomForest fallback
+--model tabnet     : optional pytorch-tabnet backend
+
+Install examples
+----------------
+python -m pip install pandas numpy scikit-learn
+python -m pip install catboost
+python -m pip install lightgbm
+python -m pip install pytorch-tabnet torch
+
+Example
+-------
+python cesmlc_v6_train_problem_state_model.py ^
+  --dataset "C:\\Temp\\cesmlc_v6_seed_akr3aesme01_30d_outputs\\cesmlc_v6_problem_state_training_dataset.csv" ^
+  --out-dir "C:\\Temp\\cesmlc_v6_ml_akr3aesme01_30d_outputs" ^
+  --model auto ^
+  --test-size 0.25 ^
+  --train-verbose 25
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import pickle
+import re
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "6.0.0-problem-state-weak-semisupervised-ml"
+NULL_STRINGS = {"", "NULL", "(NULL)", "NAN", "NONE", "NA", "N/A", "<NA>", "-"}
+
+PROBLEM_LABELS = {
+    "AUDIT_PUSH_NOT_APPLIED",
+    "INVALID_LATEST_SOURCE_VALUE",
+    "FALLBACK_TO_DEFAULT_VALUE",
+    "REAL_BACK_AND_FORTH_INSTABILITY",
+    "HIGH_FREQUENCY_DIFFERENT_VALUES",
+    "SAME_DAY_SOURCE_CONFLICT",
+    "PERSISTENT_SOURCE_INSTABILITY",
+    "LATEST_DAY_SOURCE_CHANGE",
+}
+SUPPRESSOR_LABELS = {
+    "SUPPRESSED_NORMAL_STABLE_SOURCE_CHANGE",
+    "SUPPRESSED_BULK_OR_REFRESH_PATTERN",
+    "SUPPRESSED_COORDINATED_MULTI_FIELD_CHANGE",
+}
+DEFAULT_HOLD_LABELS = {
+    "DB_PUSH_CHECK_CANDIDATE_STABLE_SOURCE",
+    "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL",
+    "LOW_INFORMATION_STABLE_SOURCE_HISTORY",
+}
+
+RUN_START_TIME = time.time()
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    prefix = "  " * max(0, int(indent))
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {prefix}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def normalize_key_value(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def safe_numeric(s: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    if len(s) == 0:
+        return s
+    if s.nunique(dropna=False) <= 1:
+        return pd.Series(np.ones(len(s)) * 50.0, index=s.index)
+    return s.rank(method="average", pct=True) * 100.0
+
+
+def sanitize_label(x: object) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(x).strip().upper()).strip("_") or "UNKNOWN"
+
+
+def read_csv_clean(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [clean_col_name(c) for c in df.columns]
+    if "ECGI" in df.columns:
+        df["ECGI"] = df["ECGI"].map(normalize_key_value)
+    if "FEATURE" in df.columns:
+        df["FEATURE"] = df["FEATURE"].map(clean_col_name)
+    return df
+
+
+def label_is_nonempty(x: object) -> bool:
+    if pd.isna(x):
+        return False
+    s = str(x).strip()
+    return bool(s and s.upper() not in NULL_STRINGS and s.lower() != "nan")
+
+
+def load_and_prepare_dataset(dataset_path: Path, manual_labels_path: Optional[Path], min_class_count: int, keep_rare_labels: bool, exclude_hold_labels: bool) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    header("STEP 1 - LOAD V6 SEED DATASET AND OPTIONAL MANUAL LABELS")
+    df = read_csv_clean(dataset_path)
+    log(f"Dataset rows loaded: {len(df):,}", indent=1)
+    if "SEED_LABEL" not in df.columns:
+        raise ValueError("Dataset must contain SEED_LABEL. Use output from cesmlc_v6_seed_label_dataset_builder.py.")
+    if "FEATURE" not in df.columns or "ECGI" not in df.columns:
+        raise ValueError("Dataset must contain ECGI and FEATURE columns.")
+
+    df["SEED_LABEL"] = df["SEED_LABEL"].astype(str).map(sanitize_label)
+    if "TRAIN_FOR_MODEL_FLAG" not in df.columns:
+        df["TRAIN_FOR_MODEL_FLAG"] = 1
+    if "TRAINING_WEIGHT" not in df.columns:
+        df["TRAINING_WEIGHT"] = 1.0
+    if "SEED_LABEL_CONFIDENCE" not in df.columns:
+        df["SEED_LABEL_CONFIDENCE"] = 0.50
+
+    df["MANUAL_LABEL"] = df.get("MANUAL_LABEL", "")
+    df["MANUAL_LABEL_NOTES"] = df.get("MANUAL_LABEL_NOTES", "")
+    df["LABEL_SOURCE_FOR_MODEL"] = "seed_label"
+
+    if manual_labels_path:
+        manual = read_csv_clean(manual_labels_path)
+        if "MANUAL_LABEL" not in manual.columns:
+            raise ValueError("Manual label CSV must contain MANUAL_LABEL column.")
+        manual = manual[[c for c in ["ECGI", "FEATURE", "MANUAL_LABEL", "MANUAL_LABEL_NOTES"] if c in manual.columns]].copy()
+        manual = manual[manual["MANUAL_LABEL"].map(label_is_nonempty)].copy()
+        manual["MANUAL_LABEL"] = manual["MANUAL_LABEL"].astype(str).map(sanitize_label)
+        if manual.empty:
+            log("Manual label file was provided but no non-empty MANUAL_LABEL values were found.", indent=1)
+        else:
+            log(f"Manual label rows loaded: {len(manual):,}", indent=1)
+            df = df.merge(manual, on=["ECGI", "FEATURE"], how="left", suffixes=("", "_MANUAL_FILE"))
+            file_label_mask = df.get("MANUAL_LABEL_MANUAL_FILE", pd.Series([np.nan] * len(df))).map(label_is_nonempty)
+            df.loc[file_label_mask, "MANUAL_LABEL"] = df.loc[file_label_mask, "MANUAL_LABEL_MANUAL_FILE"].astype(str).map(sanitize_label)
+            if "MANUAL_LABEL_NOTES_MANUAL_FILE" in df.columns:
+                df.loc[file_label_mask, "MANUAL_LABEL_NOTES"] = df.loc[file_label_mask, "MANUAL_LABEL_NOTES_MANUAL_FILE"].fillna("")
+            df = df.drop(columns=[c for c in ["MANUAL_LABEL_MANUAL_FILE", "MANUAL_LABEL_NOTES_MANUAL_FILE"] if c in df.columns], errors="ignore")
+            log(f"Rows with manual override after merge: {int(df['MANUAL_LABEL'].map(label_is_nonempty).sum()):,}", indent=1)
+
+    manual_mask = df["MANUAL_LABEL"].map(label_is_nonempty)
+    df["FINAL_TRAINING_LABEL"] = np.where(manual_mask, df["MANUAL_LABEL"].astype(str).map(sanitize_label), df["SEED_LABEL"].astype(str).map(sanitize_label))
+    df.loc[manual_mask, "LABEL_SOURCE_FOR_MODEL"] = "manual_label"
+    df.loc[manual_mask, "TRAIN_FOR_MODEL_FLAG"] = 1
+    df.loc[manual_mask, "TRAINING_WEIGHT"] = np.maximum(safe_numeric(df.loc[manual_mask, "TRAINING_WEIGHT"], 1.0), 1.25)
+    df.loc[manual_mask, "SEED_LABEL_CONFIDENCE"] = np.maximum(safe_numeric(df.loc[manual_mask, "SEED_LABEL_CONFIDENCE"], 1.0), 1.0)
+
+    hold_labels = DEFAULT_HOLD_LABELS if exclude_hold_labels else set()
+    train_pool = df[(safe_numeric(df["TRAIN_FOR_MODEL_FLAG"]) == 1) | manual_mask].copy()
+    if hold_labels:
+        before = len(train_pool)
+        train_pool = train_pool[(~train_pool["FINAL_TRAINING_LABEL"].isin(hold_labels)) | (train_pool["LABEL_SOURCE_FOR_MODEL"] == "manual_label")].copy()
+        log(f"Excluded hold/needs-review labels from seed training pool: {before - len(train_pool):,}", indent=1)
+
+    counts = train_pool["FINAL_TRAINING_LABEL"].value_counts()
+    rare = counts[counts < int(min_class_count)]
+    rare_df = rare.rename_axis("FINAL_TRAINING_LABEL").reset_index(name="ROW_COUNT")
+    if not rare.empty and not keep_rare_labels:
+        log(f"Dropping rare labels with < {min_class_count} rows: {rare.to_dict()}", indent=1)
+        train_pool = train_pool[~train_pool["FINAL_TRAINING_LABEL"].isin(rare.index)].copy()
+    elif not rare.empty:
+        log(f"Keeping rare labels despite low count: {rare.to_dict()}", indent=1)
+
+    if train_pool["FINAL_TRAINING_LABEL"].nunique() < 2:
+        raise RuntimeError("Training pool has fewer than two labels after filtering. Lower thresholds or add manual labels.")
+
+    log(f"Training-pool rows: {len(train_pool):,}", indent=1)
+    log(f"Training labels: {train_pool['FINAL_TRAINING_LABEL'].value_counts().to_dict()}", indent=1)
+    return df.reset_index(drop=True), train_pool.reset_index(drop=True), rare_df
+
+
+def select_feature_columns(df: pd.DataFrame, include_rule_flags: bool = False) -> Tuple[List[str], List[str], List[str]]:
+    # Do not include target/evidence/leakage columns. Base counts, distances, default flags, and history metrics stay in.
+    explicit_exclude = {
+        "ECGI", "ECGI_LABEL", "MANUAL_LABEL", "MANUAL_LABEL_NOTES", "SEED_LABEL", "FINAL_TRAINING_LABEL",
+        "LABEL_SOURCE_FOR_MODEL", "SOURCE_FEATURE_EVIDENCE_SUMMARY", "RECOMMENDED_ACTION", "SUPPRESSION_REASON",
+        "ANALYSIS_START_DATE", "ANALYSIS_END_DATE", "FIRST_OBSERVED_DATE", "LAST_OBSERVED_DATE",
+        "SOURCE_FIRST_CHANGE_DATE", "SOURCE_LAST_CHANGE_DATE", "LATEST_SOURCE_CHANGE_DATE",
+        "SOURCE_FIRST_CONFLICT_DATE", "SOURCE_LAST_CONFLICT_DATE", "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE",
+        "LATEST_SOURCE_VALUE_LAST_SEEN_DATE", "LATEST_CANDIDATE_DATE",
+        "FIRST_SOURCE_VALUE", "LATEST_SOURCE_VALUE", "PREVIOUS_NONLATEST_SOURCE_VALUE", "MODE_SOURCE_VALUE",
+        "FIRST_DB_VALUE", "LATEST_DB_VALUE", "PREVIOUS_NONLATEST_DB_VALUE", "LATEST_PREVIOUS_SOURCE_VALUE",
+        "LATEST_CURRENT_SOURCE_VALUE", "SOURCE_LATEST_CHANGE",
+        "SEED_RULE_SCORE", "SEED_RULE_PERCENTILE", "SEED_LABEL_CONFIDENCE", "TRAINING_WEIGHT",
+        "TRAIN_FOR_MODEL_FLAG", "IS_REPORTABLE_PROBLEM", "IS_SUPPRESSED_NORMAL", "NEEDS_MANUAL_REVIEW",
+    }
+    direct_rule_flags = {
+        "AUDIT_PUSH_NOT_APPLIED_FLAG", "FALLBACK_TO_DEFAULT_VALUE_FLAG", "REAL_BACK_AND_FORTH_FLAG",
+        "HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", "SOURCE_SAME_DAY_CONFLICT_FLAG", "PERSISTENT_SOURCE_INSTABILITY_FLAG",
+        "NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG", "BULK_OR_REFRESH_SUPPRESSOR_FLAG",
+        "COORDINATED_MULTI_FIELD_SUPPRESSOR_FLAG", "DB_PUSH_CHECK_CANDIDATE_FLAG", "HAS_PROBLEM_SEED_FLAG",
+    }
+    if not include_rule_flags:
+        explicit_exclude |= direct_rule_flags
+
+    categorical_candidates = ["FEATURE", "REGION", "MARKETCLUSTER", "MARKET", "SUBMARKET", "SERVER_ID"]
+    categorical_features = [c for c in categorical_candidates if c in df.columns and c not in explicit_exclude]
+    numeric_features: List[str] = []
+    for c in df.columns:
+        if c in explicit_exclude or c in categorical_features:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            numeric_features.append(c)
+        else:
+            # If it is object but mostly numeric, include after conversion.
+            maybe = pd.to_numeric(df[c], errors="coerce")
+            if maybe.notna().mean() > 0.90:
+                numeric_features.append(c)
+    model_features = categorical_features + numeric_features
+    if not model_features:
+        raise ValueError("No model features selected. Check dataset columns and exclusion rules.")
+    return model_features, categorical_features, numeric_features
+
+
+def prepare_X(df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = df.copy()
+    for c in features:
+        if c not in X.columns:
+            X[c] = "UNKNOWN" if c in categorical_features else 0
+    X = X[features].copy()
+    for c in categorical_features:
+        X[c] = X[c].fillna("UNKNOWN").astype(str).replace({"": "UNKNOWN", "nan": "UNKNOWN", "None": "UNKNOWN"})
+    for c in X.columns:
+        if c not in categorical_features:
+            X[c] = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
+    return X
+
+
+def get_backend(model_choice: str):
+    m = model_choice.lower().strip()
+    if m == "catboost":
+        try:
+            from catboost import CatBoostClassifier  # type: ignore
+            return "catboost", CatBoostClassifier
+        except Exception as exc:
+            raise RuntimeError("CatBoost requested but unavailable. Install: python -m pip install catboost") from exc
+    if m == "lightgbm":
+        try:
+            from lightgbm import LGBMClassifier  # type: ignore
+            return "lightgbm", LGBMClassifier
+        except Exception as exc:
+            raise RuntimeError("LightGBM requested but unavailable. Install: python -m pip install lightgbm") from exc
+    if m == "sklearn_rf":
+        from sklearn.ensemble import RandomForestClassifier
+        return "sklearn_rf", RandomForestClassifier
+    if m == "tabnet":
+        try:
+            from pytorch_tabnet.tab_model import TabNetClassifier  # type: ignore
+            return "tabnet", TabNetClassifier
+        except Exception as exc:
+            raise RuntimeError("TabNet requested but unavailable. Install: python -m pip install pytorch-tabnet torch") from exc
+    if m == "auto":
+        try:
+            from catboost import CatBoostClassifier  # type: ignore
+            return "catboost", CatBoostClassifier
+        except Exception:
+            pass
+        try:
+            from lightgbm import LGBMClassifier  # type: ignore
+            return "lightgbm", LGBMClassifier
+        except Exception:
+            pass
+        from sklearn.ensemble import RandomForestClassifier
+        return "sklearn_rf", RandomForestClassifier
+    raise ValueError("--model must be one of: auto, catboost, lightgbm, sklearn_rf, tabnet")
+
+
+def train_test_split_safe(df: pd.DataFrame, label_col: str, test_size: float, random_state: int):
+    from sklearn.model_selection import train_test_split
+    y = df[label_col].astype(str)
+    counts = y.value_counts()
+    stratify = y if counts.min() >= 2 and len(counts) > 1 else None
+    train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state, stratify=stratify)
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
+
+
+class TabNetWrapper:
+    def __init__(self, TabNetClassifierClass, categorical_features: List[str], numeric_features: List[str], random_state: int, epochs: int, batch_size: int, learning_rate: float, patience: int, train_verbose: int):
+        self.TabNetClassifierClass = TabNetClassifierClass
+        self.categorical_features = list(categorical_features)
+        self.numeric_features = list(numeric_features)
+        self.random_state = int(random_state)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.learning_rate = float(learning_rate)
+        self.patience = int(patience)
+        self.train_verbose = int(train_verbose)
+        self.cat_encoder = None
+        self.num_medians: Dict[str, float] = {}
+        self.num_means: Dict[str, float] = {}
+        self.num_stds: Dict[str, float] = {}
+        self.label_encoder = None
+        self.model = None
+        self.classes_: np.ndarray = np.array([])
+
+    def _fit_transform_X(self, df: pd.DataFrame):
+        from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
+        X_cat_parts = []
+        if self.categorical_features:
+            self.cat_encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+            cat = df[self.categorical_features].fillna("UNKNOWN").astype(str)
+            X_cat = self.cat_encoder.fit_transform(cat).astype("int64") + 1
+            X_cat_parts.append(X_cat)
+        X_num_parts = []
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            med = float(vals.median()) if vals.notna().any() else 0.0
+            vals = vals.fillna(med)
+            mean = float(vals.mean()) if len(vals) else 0.0
+            std = float(vals.std(ddof=0)) if len(vals) else 1.0
+            if not np.isfinite(std) or std <= 1e-8:
+                std = 1.0
+            self.num_medians[c] = med
+            self.num_means[c] = mean
+            self.num_stds[c] = std
+            X_num_parts.append(((vals - mean) / std).astype("float32").values.reshape(-1, 1))
+        parts = []
+        if X_cat_parts:
+            parts.append(X_cat_parts[0].astype("float32"))
+        if X_num_parts:
+            parts.append(np.hstack(X_num_parts).astype("float32"))
+        if not parts:
+            return np.zeros((len(df), 1), dtype="float32")
+        return np.hstack(parts).astype("float32")
+
+    def _transform_X(self, df: pd.DataFrame):
+        parts = []
+        if self.categorical_features:
+            cat = df[self.categorical_features].fillna("UNKNOWN").astype(str)
+            X_cat = self.cat_encoder.transform(cat).astype("int64") + 1
+            X_cat[X_cat < 0] = 0
+            parts.append(X_cat.astype("float32"))
+        num_parts = []
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            vals = vals.fillna(self.num_medians.get(c, 0.0))
+            vals = (vals - self.num_means.get(c, 0.0)) / self.num_stds.get(c, 1.0)
+            num_parts.append(vals.astype("float32").values.reshape(-1, 1))
+        if num_parts:
+            parts.append(np.hstack(num_parts).astype("float32"))
+        if not parts:
+            return np.zeros((len(df), 1), dtype="float32")
+        return np.hstack(parts).astype("float32")
+
+    def fit(self, train_df: pd.DataFrame, valid_df: Optional[pd.DataFrame], label_col: str, sample_weight: Optional[np.ndarray] = None):
+        import torch
+        from sklearn.preprocessing import LabelEncoder
+        self.label_encoder = LabelEncoder()
+        y_train = self.label_encoder.fit_transform(train_df[label_col].astype(str).values)
+        self.classes_ = self.label_encoder.classes_
+        X_train = self._fit_transform_X(train_df)
+        eval_set = None
+        eval_name = None
+        if valid_df is not None and len(valid_df) > 0:
+            X_valid = self._transform_X(valid_df)
+            y_valid = self.label_encoder.transform(valid_df[label_col].astype(str).values)
+            eval_set = [(X_valid, y_valid)]
+            eval_name = ["validation"]
+        cat_idxs = list(range(len(self.categorical_features)))
+        cat_dims = []
+        if self.categorical_features and self.cat_encoder is not None:
+            for cats in self.cat_encoder.categories_:
+                cat_dims.append(len(cats) + 2)
+        self.model = self.TabNetClassifierClass(
+            cat_idxs=cat_idxs,
+            cat_dims=cat_dims,
+            cat_emb_dim=8,
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=self.learning_rate),
+            seed=self.random_state,
+            verbose=max(1, self.train_verbose) if self.train_verbose else 0,
+        )
+        self.model.fit(
+            X_train=X_train,
+            y_train=y_train,
+            eval_set=eval_set,
+            eval_name=eval_name,
+            max_epochs=self.epochs,
+            patience=self.patience,
+            batch_size=self.batch_size,
+            virtual_batch_size=min(128, self.batch_size),
+            weights=sample_weight,
+        )
+        return self
+
+    def predict_proba(self, X_df: pd.DataFrame) -> np.ndarray:
+        X = self._transform_X(X_df)
+        return self.model.predict_proba(X)
+
+    def predict(self, X_df: pd.DataFrame) -> np.ndarray:
+        idx = np.argmax(self.predict_proba(X_df), axis=1)
+        return self.classes_[idx]
+
+
+def fit_model(train_df: pd.DataFrame, valid_df: Optional[pd.DataFrame], label_col: str, features: List[str], categorical_features: List[str], backend: str, ModelClass, args: argparse.Namespace):
+    X_train = prepare_X(train_df, features, categorical_features)
+    y_train = train_df[label_col].astype(str)
+    sample_weight = safe_numeric(train_df.get("TRAINING_WEIGHT", pd.Series(np.ones(len(train_df)))), 1.0).values
+
+    if valid_df is not None and len(valid_df) > 0:
+        X_valid = prepare_X(valid_df, features, categorical_features)
+        y_valid = valid_df[label_col].astype(str)
+    else:
+        X_valid = None
+        y_valid = None
+
+    if backend == "catboost":
+        cat_idx = [X_train.columns.get_loc(c) for c in categorical_features if c in X_train.columns]
+        model = ModelClass(
+            iterations=args.iterations,
+            depth=args.depth,
+            learning_rate=args.learning_rate,
+            loss_function="MultiClass",
+            eval_metric="TotalF1",
+            random_seed=args.random_state,
+            verbose=False,
+            allow_writing_files=False,
+            auto_class_weights="Balanced",
+            od_type="Iter",
+            od_wait=args.early_stopping_rounds,
+        )
+        fit_kwargs = {"cat_features": cat_idx, "sample_weight": sample_weight, "verbose": args.train_verbose if args.train_verbose > 0 else False}
+        if X_valid is not None:
+            fit_kwargs["eval_set"] = (X_valid, y_valid)
+            fit_kwargs["use_best_model"] = True
+        model.fit(X_train, y_train, **fit_kwargs)
+        return model
+
+    if backend == "lightgbm":
+        import lightgbm as lgb
+        X_train_lgb = X_train.copy()
+        for c in categorical_features:
+            if c in X_train_lgb.columns:
+                X_train_lgb[c] = X_train_lgb[c].astype("category")
+        eval_set = [(X_train_lgb, y_train)]
+        eval_names = ["train"]
+        if X_valid is not None:
+            X_valid_lgb = X_valid.copy()
+            for c in categorical_features:
+                if c in X_valid_lgb.columns:
+                    X_valid_lgb[c] = X_valid_lgb[c].astype("category")
+            eval_set.append((X_valid_lgb, y_valid))
+            eval_names.append("validation")
+        model = ModelClass(
+            n_estimators=args.iterations,
+            learning_rate=args.learning_rate,
+            max_depth=-1,
+            num_leaves=args.num_leaves,
+            objective="multiclass",
+            class_weight="balanced",
+            random_state=args.random_state,
+            n_jobs=-1,
+        )
+        callbacks = []
+        if args.train_verbose > 0:
+            callbacks.append(lgb.log_evaluation(period=args.train_verbose))
+        if X_valid is not None:
+            callbacks.append(lgb.early_stopping(stopping_rounds=args.early_stopping_rounds))
+        model.fit(
+            X_train_lgb,
+            y_train,
+            sample_weight=sample_weight,
+            eval_set=eval_set,
+            eval_names=eval_names,
+            eval_metric="multi_logloss",
+            callbacks=callbacks,
+        )
+        return model
+
+    if backend == "sklearn_rf":
+        from sklearn.compose import ColumnTransformer
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder
+        numeric_features = [c for c in features if c not in categorical_features]
+        pre = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=args.onehot_min_frequency), categorical_features),
+                ("num", SimpleImputer(strategy="median"), numeric_features),
+            ],
+            remainder="drop",
+            sparse_threshold=0.3,
+        )
+        clf = RandomForestClassifier(
+            n_estimators=args.rf_estimators,
+            max_depth=args.rf_max_depth if args.rf_max_depth > 0 else None,
+            min_samples_leaf=args.rf_min_samples_leaf,
+            class_weight="balanced_subsample",
+            random_state=args.random_state,
+            n_jobs=-1,
+        )
+        pipe = Pipeline([("preprocess", pre), ("model", clf)])
+        pipe.fit(X_train, y_train, model__sample_weight=sample_weight)
+        pipe.classes_ = pipe.named_steps["model"].classes_
+        return pipe
+
+    if backend == "tabnet":
+        numeric_features = [c for c in features if c not in categorical_features]
+        model = TabNetWrapper(
+            TabNetClassifierClass=ModelClass,
+            categorical_features=categorical_features,
+            numeric_features=numeric_features,
+            random_state=args.random_state,
+            epochs=args.tabnet_epochs,
+            batch_size=args.tabnet_batch_size,
+            learning_rate=args.tabnet_lr,
+            patience=args.early_stopping_rounds,
+            train_verbose=args.train_verbose,
+        )
+        model.fit(train_df=X_train.assign(**{label_col: y_train.values}), valid_df=(X_valid.assign(**{label_col: y_valid.values}) if X_valid is not None else None), label_col=label_col, sample_weight=sample_weight)
+        return model
+
+    raise ValueError(f"Unsupported backend: {backend}")
+
+
+def predict_model(model, backend: str, df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = prepare_X(df, features, categorical_features)
+    if backend == "lightgbm":
+        for c in categorical_features:
+            if c in X.columns:
+                X[c] = X[c].astype("category")
+    pred = model.predict(X)
+    pred = np.asarray(pred).reshape(-1).astype(str)
+    out = pd.DataFrame({"MODEL_PREDICTED_LABEL": pred})
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        classes = list(model.classes_) if hasattr(model, "classes_") else [f"CLASS_{i}" for i in range(proba.shape[1])]
+        for i, cls in enumerate(classes):
+            out[f"PRED_PROBA_{sanitize_label(cls)}"] = proba[:, i]
+        out["MODEL_CONFIDENCE"] = np.max(proba, axis=1)
+    else:
+        out["MODEL_CONFIDENCE"] = np.nan
+    return out
+
+
+def evaluate_predictions(y_true: pd.Series, pred_df: pd.DataFrame, out_dir: Path, prefix: str) -> Dict[str, object]:
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score
+    y_true = y_true.astype(str)
+    y_pred = pred_df["MODEL_PREDICTED_LABEL"].astype(str)
+    labels = sorted(set(y_true.unique()).union(set(y_pred.unique())))
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    pd.DataFrame(report).T.to_csv(out_dir / f"{prefix}_classification_report.csv")
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    pd.DataFrame(cm, index=[f"TRUE_{x}" for x in labels], columns=[f"PRED_{x}" for x in labels]).to_csv(out_dir / f"{prefix}_confusion_matrix.csv")
+    return {
+        "rows": int(len(y_true)),
+        "classes": int(len(labels)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+    }
+
+
+def get_feature_importance(model, backend: str, features: List[str]) -> pd.DataFrame:
+    if backend == "catboost":
+        try:
+            imp = model.get_feature_importance()
+            return pd.DataFrame({"FEATURE": features, "IMPORTANCE": imp}).sort_values("IMPORTANCE", ascending=False)
+        except Exception:
+            pass
+    if backend == "lightgbm" and hasattr(model, "feature_importances_"):
+        return pd.DataFrame({"FEATURE": features, "IMPORTANCE": model.feature_importances_}).sort_values("IMPORTANCE", ascending=False)
+    if backend == "sklearn_rf":
+        try:
+            clf = model.named_steps["model"]
+            pre = model.named_steps["preprocess"]
+            names = []
+            try:
+                names = list(pre.get_feature_names_out())
+            except Exception:
+                names = [f"FEATURE_{i}" for i in range(len(clf.feature_importances_))]
+            return pd.DataFrame({"FEATURE": names, "IMPORTANCE": clf.feature_importances_}).sort_values("IMPORTANCE", ascending=False)
+        except Exception:
+            pass
+    return pd.DataFrame({"FEATURE": features, "IMPORTANCE": np.nan})
+
+
+def add_score_columns(scored: pd.DataFrame) -> pd.DataFrame:
+    out = scored.copy()
+    proba_cols = [c for c in out.columns if c.startswith("PRED_PROBA_")]
+    problem_cols = [f"PRED_PROBA_{sanitize_label(lbl)}" for lbl in PROBLEM_LABELS if f"PRED_PROBA_{sanitize_label(lbl)}" in out.columns]
+    suppress_cols = [f"PRED_PROBA_{sanitize_label(lbl)}" for lbl in SUPPRESSOR_LABELS if f"PRED_PROBA_{sanitize_label(lbl)}" in out.columns]
+    if problem_cols:
+        out["ML_PROBLEM_PROBABILITY"] = out[problem_cols].sum(axis=1).clip(0, 1)
+    else:
+        out["ML_PROBLEM_PROBABILITY"] = np.where(out["MODEL_PREDICTED_LABEL"].isin(PROBLEM_LABELS), out["MODEL_CONFIDENCE"], 0)
+    if suppress_cols:
+        out["ML_SUPPRESSOR_PROBABILITY"] = out[suppress_cols].sum(axis=1).clip(0, 1)
+    else:
+        out["ML_SUPPRESSOR_PROBABILITY"] = np.where(out["MODEL_PREDICTED_LABEL"].isin(SUPPRESSOR_LABELS), out["MODEL_CONFIDENCE"], 0)
+    if "SEED_RULE_PERCENTILE" not in out.columns:
+        out["SEED_RULE_PERCENTILE"] = percentile_rank(out.get("SEED_RULE_SCORE", pd.Series(np.zeros(len(out)))))
+    if "FEATURE_CRITICALITY_WEIGHT" in out.columns:
+        out["FEATURE_CRITICALITY_PERCENTILE"] = percentile_rank(out["FEATURE_CRITICALITY_WEIGHT"])
+    else:
+        out["FEATURE_CRITICALITY_PERCENTILE"] = 50.0
+    out["ML_FINAL_PROBLEM_SCORE"] = (
+        0.80 * 100.0 * out["ML_PROBLEM_PROBABILITY"].fillna(0)
+        + 0.15 * out["SEED_RULE_PERCENTILE"].fillna(0)
+        + 0.05 * out["FEATURE_CRITICALITY_PERCENTILE"].fillna(0)
+        - 0.20 * 100.0 * out["ML_SUPPRESSOR_PROBABILITY"].fillna(0)
+    ).clip(lower=0)
+    out["ML_FINAL_PROBLEM_PERCENTILE"] = percentile_rank(out["ML_FINAL_PROBLEM_SCORE"])
+    out["MODEL_RECOMMENDED_BUCKET"] = np.select(
+        [
+            out["ML_PROBLEM_PROBABILITY"] >= 0.80,
+            out["ML_PROBLEM_PROBABILITY"] >= 0.60,
+            out["ML_SUPPRESSOR_PROBABILITY"] >= 0.70,
+        ],
+        ["HIGH_CONFIDENCE_PROBLEM", "MEDIUM_CONFIDENCE_PROBLEM", "LIKELY_SUPPRESSED_NORMAL"],
+        default="NEEDS_REVIEW_OR_LOW_CONFIDENCE",
+    )
+    return out
+
+
+def pseudo_label_and_retrain(model, backend: str, train_model_df: pd.DataFrame, valid_model_df: pd.DataFrame, unlabeled_df: pd.DataFrame, features: List[str], categorical_features: List[str], ModelClass, args: argparse.Namespace):
+    if unlabeled_df.empty:
+        log("Pseudo-labeling skipped: no unlabeled/hold rows available.", indent=1)
+        return model, pd.DataFrame()
+    pred = predict_model(model, backend, unlabeled_df, features, categorical_features)
+    scored_unlabeled = pd.concat([unlabeled_df.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+    scored_unlabeled = add_score_columns(scored_unlabeled)
+    pseudo = scored_unlabeled[
+        (scored_unlabeled["MODEL_CONFIDENCE"] >= float(args.pseudo_label_min_confidence))
+        & (~scored_unlabeled["MODEL_PREDICTED_LABEL"].isin(DEFAULT_HOLD_LABELS))
+    ].copy()
+    if args.pseudo_label_max_rows > 0 and len(pseudo) > args.pseudo_label_max_rows:
+        pseudo = pseudo.sort_values("MODEL_CONFIDENCE", ascending=False).head(args.pseudo_label_max_rows).copy()
+    if pseudo.empty:
+        log("Pseudo-labeling found no rows above threshold.", indent=1)
+        return model, pseudo
+    pseudo["FINAL_TRAINING_LABEL"] = pseudo["MODEL_PREDICTED_LABEL"].astype(str)
+    pseudo["LABEL_SOURCE_FOR_MODEL"] = "pseudo_label"
+    pseudo["TRAINING_WEIGHT"] = float(args.pseudo_label_weight) * pd.to_numeric(pseudo["MODEL_CONFIDENCE"], errors="coerce").fillna(0.0)
+    log(f"Pseudo-label rows added for retraining: {len(pseudo):,}", indent=1)
+    augmented_train = pd.concat([train_model_df, pseudo[train_model_df.columns.intersection(pseudo.columns)]], ignore_index=True, sort=False)
+    # Ensure missing columns from train are present in pseudo concat result.
+    for c in train_model_df.columns:
+        if c not in augmented_train.columns:
+            augmented_train[c] = train_model_df[c].iloc[0] if len(train_model_df) else 0
+    model2 = fit_model(augmented_train, valid_model_df, "FINAL_TRAINING_LABEL", features, categorical_features, backend, ModelClass, args)
+    return model2, pseudo
+
+
+def write_training_report(out_dir: Path, dataset: pd.DataFrame, train_pool: pd.DataFrame, scored: pd.DataFrame, model_info: Dict[str, Any], rare_df: pd.DataFrame, pseudo_df: pd.DataFrame) -> None:
+    lines: List[str] = []
+    lines.append("# CESMLC V6 Problem-State ML Training Report")
+    lines.append("")
+    lines.append(f"Script version: `{SCRIPT_VERSION}`")
+    lines.append(f"Backend: `{model_info.get('backend')}`")
+    lines.append("")
+    lines.append("## Purpose")
+    lines.append("This model learns V6 problem-state seed/manual labels. It is not the old Phase 1 source-change counter and it does not train directly on old Phase 1 rule labels.")
+    lines.append("")
+    lines.append("## Dataset summary")
+    lines.append(f"- All candidate ECGI-feature rows: **{len(dataset):,}**")
+    lines.append(f"- Training pool rows: **{len(train_pool):,}**")
+    lines.append(f"- Scored rows: **{len(scored):,}**")
+    lines.append(f"- Model features: **{len(model_info.get('features', [])):,}**")
+    lines.append(f"- Categorical features: **{', '.join(model_info.get('categorical_features', []))}**")
+    lines.append(f"- Direct seed-rule flags included as features: **{model_info.get('include_rule_flags')}**")
+    lines.append("")
+    lines.append("## Training label distribution")
+    for label, count in train_pool["FINAL_TRAINING_LABEL"].value_counts().items():
+        lines.append(f"- **{label}**: {int(count):,}")
+    lines.append("")
+    if not rare_df.empty:
+        lines.append("## Rare labels")
+        for _, r in rare_df.iterrows():
+            lines.append(f"- **{r['FINAL_TRAINING_LABEL']}**: {int(r['ROW_COUNT'])}")
+        lines.append("")
+    lines.append("## Test metrics")
+    for k, v in model_info.get("test_metrics", {}).items():
+        lines.append(f"- {k}: `{v}`")
+    lines.append("")
+    if not pseudo_df.empty:
+        lines.append("## Pseudo-labeling")
+        lines.append(f"- Pseudo-labeled rows used for retraining: **{len(pseudo_df):,}**")
+        for label, count in pseudo_df["FINAL_TRAINING_LABEL"].value_counts().items():
+            lines.append(f"  - {label}: {int(count):,}")
+        lines.append("")
+    lines.append("## Top scored problem rows")
+    top_cols = [
+        "ML_PROBLEM_RANK", "ECGI_LABEL", "ECGI", "FEATURE", "SEED_LABEL", "FINAL_TRAINING_LABEL",
+        "MODEL_PREDICTED_LABEL", "MODEL_CONFIDENCE", "ML_PROBLEM_PROBABILITY", "ML_FINAL_PROBLEM_SCORE",
+        "SERVER_ID", "MARKET", "LATEST_SOURCE_VALUE", "PREVIOUS_NONLATEST_SOURCE_VALUE", "LATEST_DB_VALUE",
+        "SOURCE_CHANGE_DAYS_COUNT", "DISTINCT_SOURCE_VALUES_30D",
+    ]
+    for _, r in scored.head(25).iterrows():
+        parts = []
+        for c in top_cols:
+            if c in scored.columns:
+                parts.append(f"{c}={r.get(c, '')}")
+        lines.append("- " + " | ".join(parts))
+    lines.append("")
+    lines.append("## Output files")
+    for fname in [
+        "cesmlc_v6_ml_scores_all.csv",
+        "cesmlc_v6_ml_scores_top300.csv",
+        "cesmlc_v6_ml_test_predictions.csv",
+        "cesmlc_v6_ml_classification_report.csv",
+        "cesmlc_v6_ml_confusion_matrix.csv",
+        "cesmlc_v6_ml_feature_importance.csv",
+        "cesmlc_v6_problem_state_model_artifact.pkl",
+    ]:
+        lines.append(f"- `{fname}`")
+    (out_dir / "cesmlc_v6_ml_training_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def train_and_score(dataset: pd.DataFrame, train_pool: pd.DataFrame, rare_df: pd.DataFrame, out_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
+    header("STEP 2 - TRAIN / EVALUATE / SCORE V6 PROBLEM-STATE MODEL")
+    backend, ModelClass = get_backend(args.model)
+    log(f"Selected backend: {backend}", indent=1)
+    features, categorical_features, numeric_features = select_feature_columns(train_pool, include_rule_flags=args.include_rule_flags)
+    log(f"Model feature count: {len(features):,}", indent=1)
+    log(f"Categorical features: {categorical_features}", indent=1)
+    log(f"Numeric feature count: {len(numeric_features):,}", indent=1)
+
+    train_df, test_df = train_test_split_safe(train_pool, "FINAL_TRAINING_LABEL", args.test_size, args.random_state)
+    train_model_df, valid_model_df = train_test_split_safe(train_df, "FINAL_TRAINING_LABEL", args.eval_size, args.random_state + 17)
+    log(f"Train rows total: {len(train_df):,}", indent=1)
+    log(f"Model-train rows: {len(train_model_df):,}", indent=1)
+    log(f"Validation rows: {len(valid_model_df):,}", indent=1)
+    log(f"Test rows: {len(test_df):,}", indent=1)
+
+    model = fit_model(train_model_df, valid_model_df, "FINAL_TRAINING_LABEL", features, categorical_features, backend, ModelClass, args)
+    pseudo_df = pd.DataFrame()
+    if args.enable_pseudo_labeling:
+        train_keys = set(zip(train_pool["ECGI"].astype(str), train_pool["FEATURE"].astype(str)))
+        all_unlabeled = dataset[~dataset.apply(lambda r: (str(r["ECGI"]), str(r["FEATURE"])) in train_keys, axis=1)].copy()
+        model, pseudo_df = pseudo_label_and_retrain(model, backend, train_model_df, valid_model_df, all_unlabeled, features, categorical_features, ModelClass, args)
+
+    test_pred = predict_model(model, backend, test_df, features, categorical_features)
+    test_metrics = evaluate_predictions(test_df["FINAL_TRAINING_LABEL"], test_pred, out_dir, "cesmlc_v6_ml")
+    test_output = pd.concat([test_df.reset_index(drop=True), test_pred.reset_index(drop=True)], axis=1)
+    test_output.to_csv(out_dir / "cesmlc_v6_ml_test_predictions.csv", index=False)
+    log(f"Test metrics: {test_metrics}", indent=1)
+
+    all_pred = predict_model(model, backend, dataset, features, categorical_features)
+    scored = pd.concat([dataset.reset_index(drop=True), all_pred.reset_index(drop=True)], axis=1)
+    scored = add_score_columns(scored)
+    scored = scored.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    scored.insert(0, "ML_PROBLEM_RANK", np.arange(1, len(scored) + 1))
+    scored.to_csv(out_dir / "cesmlc_v6_ml_scores_all.csv", index=False)
+    scored.head(args.top_n).to_csv(out_dir / "cesmlc_v6_ml_scores_top300.csv", index=False)
+
+    feature_importance = get_feature_importance(model, backend, features)
+    feature_importance.to_csv(out_dir / "cesmlc_v6_ml_feature_importance.csv", index=False)
+
+    artifact = {
+        "script_version": SCRIPT_VERSION,
+        "backend": backend,
+        "features": features,
+        "categorical_features": categorical_features,
+        "numeric_features": numeric_features,
+        "include_rule_flags": bool(args.include_rule_flags),
+        "model": model,
+        "test_metrics": test_metrics,
+        "problem_labels": sorted(PROBLEM_LABELS),
+        "suppressor_labels": sorted(SUPPRESSOR_LABELS),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    artifact_path = out_dir / "cesmlc_v6_problem_state_model_artifact.pkl"
+    with open(artifact_path, "wb") as f:
+        pickle.dump(artifact, f)
+    log(f"Saved model artifact: {artifact_path}", indent=1)
+
+    # Report tables.
+    label_summary = train_pool.groupby(["FINAL_TRAINING_LABEL", "LABEL_SOURCE_FOR_MODEL"], as_index=False).agg(
+        ROW_COUNT=("ECGI", "size"),
+        UNIQUE_ECGI=("ECGI", "nunique"),
+        AVG_WEIGHT=("TRAINING_WEIGHT", "mean"),
+        AVG_CONFIDENCE=("SEED_LABEL_CONFIDENCE", "mean"),
+    ).sort_values("ROW_COUNT", ascending=False)
+    label_summary.to_csv(out_dir / "cesmlc_v6_ml_training_label_summary.csv", index=False)
+
+    model_info = {
+        "backend": backend,
+        "features": features,
+        "categorical_features": categorical_features,
+        "numeric_features": numeric_features,
+        "include_rule_flags": bool(args.include_rule_flags),
+        "test_metrics": test_metrics,
+        "artifact_path": str(artifact_path),
+    }
+    write_training_report(out_dir, dataset, train_pool, scored, model_info, rare_df, pseudo_df)
+    return model_info
+
+
+def score_mode(dataset_path: Path, artifact_path: Path, out_dir: Path, top_n: int) -> None:
+    header("SCORE MODE - LOAD V6 MODEL ARTIFACT AND SCORE DATASET")
+    dataset = read_csv_clean(dataset_path)
+    with open(artifact_path, "rb") as f:
+        artifact = pickle.load(f)
+    model = artifact["model"]
+    backend = artifact["backend"]
+    features = artifact["features"]
+    categorical_features = artifact["categorical_features"]
+    pred = predict_model(model, backend, dataset, features, categorical_features)
+    scored = pd.concat([dataset.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+    scored = add_score_columns(scored)
+    scored = scored.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    scored.insert(0, "ML_PROBLEM_RANK", np.arange(1, len(scored) + 1))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(out_dir / "cesmlc_v6_scored_dataset_all.csv", index=False)
+    scored.head(top_n).to_csv(out_dir / "cesmlc_v6_scored_dataset_top.csv", index=False)
+    log(f"Scored rows: {len(scored):,}", indent=1)
+    log(f"Output: {out_dir / 'cesmlc_v6_scored_dataset_top.csv'}", indent=1)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CESMLC V6 weak/semi-supervised problem-state model trainer.")
+    p.add_argument("--mode", default="train", choices=["train", "score"], help="train or score")
+    p.add_argument("--dataset", required=True, type=str, help="V6 seed-label dataset CSV or scoring dataset.")
+    p.add_argument("--out-dir", required=True, type=str, help="Output folder.")
+    p.add_argument("--manual-labels", default=None, type=str, help="Optional manual label CSV with ECGI, FEATURE, MANUAL_LABEL.")
+    p.add_argument("--model-artifact", default=None, type=str, help="Existing artifact for --mode score.")
+
+    p.add_argument("--model", default="auto", choices=["auto", "catboost", "lightgbm", "sklearn_rf", "tabnet"])
+    p.add_argument("--test-size", default=0.25, type=float)
+    p.add_argument("--eval-size", default=0.20, type=float)
+    p.add_argument("--random-state", default=42, type=int)
+    p.add_argument("--min-class-count", default=20, type=int, help="Drop seed labels with fewer rows unless --keep-rare-labels is used.")
+    p.add_argument("--keep-rare-labels", action="store_true")
+    p.add_argument("--include-hold-labels", action="store_true", help="Train on hold/needs-review labels. Default excludes them unless manual.")
+    p.add_argument("--include-rule-flags", action="store_true", help="Include direct seed-rule indicator flags. Off by default to avoid memorizing seed rules.")
+
+    p.add_argument("--iterations", default=1000, type=int)
+    p.add_argument("--depth", default=6, type=int)
+    p.add_argument("--learning-rate", default=0.04, type=float)
+    p.add_argument("--num-leaves", default=63, type=int)
+    p.add_argument("--early-stopping-rounds", default=80, type=int)
+    p.add_argument("--train-verbose", default=25, type=int)
+
+    p.add_argument("--rf-estimators", default=400, type=int)
+    p.add_argument("--rf-max-depth", default=0, type=int)
+    p.add_argument("--rf-min-samples-leaf", default=2, type=int)
+    p.add_argument("--onehot-min-frequency", default=5, type=int)
+
+    p.add_argument("--tabnet-epochs", default=120, type=int)
+    p.add_argument("--tabnet-batch-size", default=2048, type=int)
+    p.add_argument("--tabnet-lr", default=0.01, type=float)
+
+    p.add_argument("--enable-pseudo-labeling", action="store_true")
+    p.add_argument("--pseudo-label-min-confidence", default=0.92, type=float)
+    p.add_argument("--pseudo-label-weight", default=0.35, type=float)
+    p.add_argument("--pseudo-label-max-rows", default=100000, type=int)
+
+    p.add_argument("--top-n", default=300, type=int)
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = Path(args.dataset).expanduser()
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    if args.mode == "score":
+        if not args.model_artifact:
+            raise ValueError("--mode score requires --model-artifact")
+        artifact_path = Path(args.model_artifact).expanduser()
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"Model artifact not found: {artifact_path}")
+        score_mode(dataset_path, artifact_path, out_dir, args.top_n)
+        return 0
+
+    header("CESMLC V6 PROBLEM-STATE WEAK/SEMI-SUPERVISED ML TRAINER")
+    log(f"Dataset: {dataset_path}")
+    log(f"Output: {out_dir}")
+    log(f"Model choice: {args.model}")
+    log(f"Direct seed-rule flags included: {bool(args.include_rule_flags)}")
+    log(f"Pseudo-labeling enabled: {bool(args.enable_pseudo_labeling)}")
+
+    manual_path = Path(args.manual_labels).expanduser() if args.manual_labels else None
+    dataset, train_pool, rare_df = load_and_prepare_dataset(
+        dataset_path=dataset_path,
+        manual_labels_path=manual_path,
+        min_class_count=args.min_class_count,
+        keep_rare_labels=args.keep_rare_labels,
+        exclude_hold_labels=not args.include_hold_labels,
+    )
+    dataset.to_csv(out_dir / "cesmlc_v6_ml_input_dataset_with_final_labels.csv", index=False)
+    train_pool.to_csv(out_dir / "cesmlc_v6_ml_training_pool.csv", index=False)
+    rare_df.to_csv(out_dir / "cesmlc_v6_ml_rare_labels.csv", index=False)
+
+    model_info = train_and_score(dataset, train_pool, rare_df, out_dir, args)
+    config = vars(args).copy()
+    config["script_version"] = SCRIPT_VERSION
+    config["model_info"] = {k: v for k, v in model_info.items() if k not in {"features", "categorical_features", "numeric_features"}}
+    (out_dir / "cesmlc_v6_ml_run_config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
+
+    header("DONE")
+    log(f"Total runtime: {elapsed_text()}")
+    log(f"Open first: {out_dir / 'cesmlc_v6_ml_training_report.md'}")
+    log(f"Open second: {out_dir / 'cesmlc_v6_ml_scores_top300.csv'}")
+    log(f"Open third: {out_dir / 'cesmlc_v6_ml_feature_importance.csv'}")
+    log(f"Deployable artifact: {out_dir / 'cesmlc_v6_problem_state_model_artifact.pkl'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
