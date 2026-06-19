@@ -1,0 +1,2009 @@
+
+
+
+
+#!/usr/bin/env python
+"""
+CESMLC LTE audit anomaly detector - V4 problem-focused source-history mode.
+
+Why V4 exists
+-------------
+The V3.x source-only detector reported many ordinary source-history changes because it scanned all
+ECGIs/features and treated any source-to-source change as potential anomaly evidence.
+
+V4 changes the target:
+
+    1. Start only from latest-day DB_MISMATCH='YES' ECGIs.
+    2. Pull 30-day SOURCE history for those candidate ECGIs only.
+    3. Do NOT compare FEATURE to FEATURE_DB for scoring in this version.
+    4. Suppress normal/stable changes and likely bulk refreshes.
+    5. Report incident-level problem classes:
+          - FALLBACK_TO_DEFAULT_VALUE
+          - REAL_BACK_AND_FORTH_INSTABILITY
+          - HIGH_FREQUENCY_DIFFERENT_VALUES
+          - SAME_DAY_SOURCE_CONFLICT
+          - PERSISTENT_SOURCE_INSTABILITY
+          - LATEST_DAY_SOURCE_CHANGE
+          - INVALID_LATEST_SOURCE_VALUE
+          - DB_MISMATCH_CANDIDATE_STABLE_SOURCE_HISTORY / low-info hold category
+
+Important limitation
+--------------------
+Because this version intentionally does not use FEATURE_DB columns, it cannot conclusively prove
+"audit push not applied to server". It will surface candidates whose latest row is DB_MISMATCH='YES'
+but source history is stable as a low-priority hold category. If those dominate the result, the next
+version should add field-level source-vs-DB history.
+
+Install once if needed:
+    python -m pip install duckdb pandas numpy
+
+Example safe run
+----------------
+python cesmlc_v4_problem_focused_source_history.py ^
+  --input "C:\\Temp\\enmt_cesmlc_lte_audit_p_akr3aesme01_30d.csv" ^
+  --days 30 ^
+  --out-dir "C:\\Temp\\cesmlc_v4_problem_focused_akr3aesme01_30d_outputs" ^
+  --include-features "PHYSICALCELLID,CELLNAME,CELLTYPE,ANTENNALAT,ANTENNALON,ANTENNAORIENTATION,ANTENNAOPENING,ANTENNAHORIZONTALRANGE,ANTENNABASEALTITUDE,GEOTYPE,RADIUS1,SRVNGAREAAVERAGEALT,SRVNGAREAAVGALTUNCERT,SUPPORTEDTECHNOLOGIES" ^
+  --latlon-decimals 5 ^
+  --memory-limit 6GB ^
+  --threads 1 ^
+  --feature-batch-size 1 ^
+  --duckdb-temp-dir "C:\\Temp\\duckdb_spill_v4"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import shutil
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "4.0.0-problem-focused-latest-db-mismatch-source-history"
+
+DATE_CANDIDATES = ["ENMT_LOAD_DATE", "PULLDATE", "LOAD_DATE", "AUDIT_DATE", "DATE"]
+META_COLS = ["REGION", "MARKETCLUSTER", "MARKET", "SUBMARKET", "SERVER_ID"]
+NULL_STRINGS = {"", "NULL", "(NULL)", "NAN", "NONE", "NA", "N/A", "<NA>", "-"}
+
+DEFAULT_FEATURES = [
+    "PHYSICALCELLID",
+    "CELLNAME",
+    "CELLTYPE",
+    "ANTENNALAT",
+    "ANTENNALON",
+    "ANTENNAORIENTATION",
+    "ANTENNAOPENING",
+    "ANTENNAHORIZONTALRANGE",
+    "ANTENNABASEALTITUDE",
+    "GEOTYPE",
+    "RADIUS1",
+    "SRVNGAREAAVERAGEALT",
+    "SRVNGAREAAVGALTUNCERT",
+    "SUPPORTEDTECHNOLOGIES",
+]
+
+ID_LIKE_EXACT = {
+    "ECGI",
+    "USID",
+    "SERVER_ID",
+    "MCC",
+    "MNC",
+    "CID",
+    "PHYSICALCELLID",
+    "PCI",
+    "PCID",
+    "CELLID",
+    "CELL_ID",
+}
+
+NUMERIC_CONFIG_TERMS = [
+    "LAT",
+    "LON",
+    "LONG",
+    "ORIENTATION",
+    "OPENING",
+    "HORIZONTALRANGE",
+    "HORIZONTAL_RANGE",
+    "RADIUS",
+    "ALTITUDE",
+    "AVERAGEALT",
+    "AVGALT",
+    "UNCERT",
+    "BEAM",
+    "WIDTH",
+    "AZIMUTH",
+    "BEARING",
+    "SPACING",
+]
+
+# Built-in defaults/valid ranges. Keep this conservative and override with --defaults-json if needed.
+# Values are normalized before comparison, so "25" also matches "25.0".
+BUILTIN_FEATURE_RULES: Dict[str, Dict[str, Any]] = {
+    "PHYSICALCELLID": {
+        "default_values": ["0"],
+        "valid_min": 0,
+        "valid_max": 1007,
+        "criticality_weight": 12,
+    },
+    "ANTENNALAT": {
+        "valid_min": -90,
+        "valid_max": 90,
+        "criticality_weight": 12,
+        "numeric_tolerance": 0.00005,
+    },
+    "ANTENNALON": {
+        "valid_min": -180,
+        "valid_max": 180,
+        "criticality_weight": 12,
+        "numeric_tolerance": 0.00005,
+    },
+    "ANTENNAORIENTATION": {
+        "valid_min": 0,
+        "valid_max": 360,
+        "criticality_weight": 10,
+    },
+    "ANTENNAOPENING": {
+        "default_values": ["120"],
+        "valid_min": 0,
+        "valid_max": 360,
+        "criticality_weight": 10,
+    },
+    "ANTENNAHORIZONTALRANGE": {
+        "default_values": ["7500"],
+        "valid_min": 0,
+        "valid_max": 100000,
+        "criticality_weight": 8,
+    },
+    "ANTENNABASEALTITUDE": {
+        "default_values": ["25"],
+        "valid_min": -1000,
+        "valid_max": 10000,
+        "criticality_weight": 7,
+    },
+    "RADIUS1": {
+        "valid_min": 1,
+        "valid_max": 100000,
+        "criticality_weight": 8,
+    },
+    "SRVNGAREAAVERAGEALT": {
+        "default_values": ["25"],
+        "valid_min": -1000,
+        "valid_max": 10000,
+        "criticality_weight": 6,
+    },
+    "SRVNGAREAAVGALTUNCERT": {
+        "valid_min": 0,
+        "valid_max": 10000,
+        "criticality_weight": 4,
+    },
+    "CELLNAME": {"criticality_weight": 10},
+    "CELLTYPE": {"criticality_weight": 8},
+    "GEOTYPE": {"criticality_weight": 7},
+    "SUPPORTEDTECHNOLOGIES": {"criticality_weight": 6},
+}
+
+RUN_START_TIME = time.time()
+
+
+# ==========================================================
+# Logging / generic helpers
+# ==========================================================
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    prefix = "  " * max(0, int(indent))
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {prefix}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def normalize_key_value(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def normalize_value_text(x: object) -> str:
+    """Normalize for exact/default comparisons but keep punctuation/sign/decimal."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    # Collapse numeric strings such as 25.0000 -> 25, 120.0 -> 120 when safe.
+    try:
+        f = float(s)
+        if math.isfinite(f):
+            if abs(f - round(f)) < 1e-12:
+                return str(int(round(f)))
+            return (f"{f:.10f}".rstrip("0").rstrip(".")).upper()
+    except Exception:
+        pass
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def excel_safe_ecgi(ecgi: object) -> str:
+    s = normalize_key_value(ecgi)
+    return f"ECGI_{s}" if s else ""
+
+
+def short_value(v: object, max_len: int = 80) -> str:
+    if pd.isna(v):
+        return "<missing>"
+    s = str(v)
+    return s if len(s) <= max_len else s[: max_len - 3] + "..."
+
+
+def transition_text(prev_value: object, current_value: object) -> str:
+    return f"{short_value(prev_value)} -> {short_value(current_value)}"
+
+
+def date_text(d: object) -> str:
+    dt = pd.to_datetime(d, errors="coerce")
+    if pd.isna(dt):
+        return ""
+    return str(dt.date())
+
+
+def safe_numeric(series: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    if len(s) == 0:
+        return s
+    if s.nunique(dropna=False) <= 1:
+        return pd.Series(np.ones(len(s)) * 50.0, index=s.index)
+    return s.rank(method="average", pct=True) * 100.0
+
+
+def first_existing(cols: Iterable[str], candidates: Iterable[str]) -> Optional[str]:
+    cset = set(cols)
+    for c in candidates:
+        if c in cset:
+            return c
+    return None
+
+
+def is_id_like_col(col: str) -> bool:
+    c = clean_col_name(col)
+    return c in ID_LIKE_EXACT or c.endswith("_ID") or c.endswith("ID") or "CELLID" in c
+
+
+def is_numeric_config_col(col: str) -> bool:
+    c = clean_col_name(col)
+    if is_id_like_col(c):
+        return False
+    return any(term in c for term in NUMERIC_CONFIG_TERMS)
+
+
+def quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def sql_string(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def sql_path(path: Path) -> str:
+    return sql_string(str(path).replace("\\", "/"))
+
+
+def chunks_list(items: List[str], size: int) -> List[List[str]]:
+    size = max(1, int(size))
+    return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+# ==========================================================
+# DuckDB SQL expressions
+# ==========================================================
+
+
+def import_duckdb():
+    try:
+        import duckdb  # type: ignore
+
+        return duckdb
+    except Exception as exc:
+        raise RuntimeError(
+            "DuckDB is required for V4 large CSV processing.\n"
+            "Install once with:\n"
+            "  python -m pip install duckdb\n"
+            f"Original import error: {exc}"
+        ) from exc
+
+
+def open_duckdb(
+    temp_db_path: Optional[Path],
+    threads: int,
+    memory_limit: Optional[str],
+    duckdb_temp_dir: Optional[Path] = None,
+):
+    log("Opening DuckDB connection")
+    duckdb = import_duckdb()
+    if temp_db_path:
+        temp_db_path.parent.mkdir(parents=True, exist_ok=True)
+        log(f"DuckDB database file: {temp_db_path}", indent=1)
+        con = duckdb.connect(str(temp_db_path))
+    else:
+        log("DuckDB database: in-memory", indent=1)
+        con = duckdb.connect()
+
+    try:
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
+
+    if duckdb_temp_dir:
+        duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+        log(f"DuckDB spill/temp directory: {duckdb_temp_dir}", indent=1)
+        try:
+            con.execute(f"SET temp_directory={sql_string(str(duckdb_temp_dir))}")
+        except Exception as exc:
+            log(f"Warning: could not set DuckDB temp_directory: {exc}", indent=1)
+
+    if threads and threads > 0:
+        con.execute(f"PRAGMA threads={int(threads)}")
+    if memory_limit:
+        con.execute(f"PRAGMA memory_limit={sql_string(memory_limit)}")
+
+    log(f"DuckDB settings: threads={threads}, memory_limit={memory_limit or 'default'}", indent=1)
+    return con
+
+
+def base_norm_expr(sql_expr: str) -> str:
+    cleaned = f"UPPER(REGEXP_REPLACE(TRIM(CAST({sql_expr} AS VARCHAR)), '\\\\.0$', ''))"
+    null_list = ", ".join(sql_string(x) for x in sorted(NULL_STRINGS))
+    return f"CASE WHEN {sql_expr} IS NULL THEN NULL WHEN {cleaned} IN ({null_list}) THEN NULL ELSE {cleaned} END"
+
+
+def compact_norm_expr(sql_expr: str) -> str:
+    """Uppercase, trim, remove spaces/trailing .0, convert null-like to NULL."""
+    base = base_norm_expr(sql_expr)
+    return f"CASE WHEN {base} IS NULL THEN NULL ELSE REGEXP_REPLACE({base}, '\\s+', '') END"
+
+
+def feature_norm_expr(original_col: str, feature: str, latlon_decimals: int) -> str:
+    q = quote_ident(original_col)
+    base = compact_norm_expr(q)
+    if is_numeric_config_col(feature):
+        decimals = latlon_decimals if any(t in feature for t in ["LAT", "LON", "LONG"]) else 4
+        # Cast rounded numeric back to VARCHAR. Python post-processing normalizes trailing .0 for default checks.
+        return (
+            f"CASE WHEN {base} IS NULL THEN NULL "
+            f"WHEN TRY_CAST({base} AS DOUBLE) IS NOT NULL "
+            f"THEN CAST(ROUND(TRY_CAST({base} AS DOUBLE), {int(decimals)}) AS VARCHAR) "
+            f"ELSE {base} END"
+        )
+    return base
+
+
+def date_parse_expr(original_col: str) -> str:
+    q = quote_ident(original_col)
+    trimmed = f"TRIM(CAST({q} AS VARCHAR))"
+    return (
+        "CAST(COALESCE("
+        f"TRY_STRPTIME({trimmed}, '%Y-%m-%d %H:%M:%S'),"
+        f"TRY_STRPTIME({trimmed}, '%Y-%m-%d'),"
+        f"TRY_STRPTIME({trimmed}, '%m/%d/%Y %H:%M:%S'),"
+        f"TRY_STRPTIME({trimmed}, '%m/%d/%Y'),"
+        f"TRY_STRPTIME({trimmed}, '%d-%b-%y'),"
+        f"TRY_STRPTIME({trimmed}, '%d-%b-%Y')"
+        ") AS DATE)"
+    )
+
+
+def ecgi_expr_from_columns(colmap: Dict[str, str]) -> str:
+    if "ECGI" in colmap:
+        return compact_norm_expr(quote_ident(colmap["ECGI"]))
+    required = ["MCC", "MNC", "CID"]
+    if all(c in colmap for c in required):
+        return (
+            f"COALESCE({compact_norm_expr(quote_ident(colmap['MCC']))}, '') || '-' || "
+            f"COALESCE({compact_norm_expr(quote_ident(colmap['MNC']))}, '') || '-' || "
+            f"COALESCE({compact_norm_expr(quote_ident(colmap['CID']))}, '')"
+        )
+    raise ValueError("Input has no ECGI column and cannot build ECGI from MCC/MNC/CID.")
+
+
+# ==========================================================
+# Header / feature detection / default config
+# ==========================================================
+
+
+def read_header(input_path: Path) -> Tuple[List[str], Dict[str, str]]:
+    log(f"Reading CSV header: {input_path}")
+    header_df = pd.read_csv(input_path, nrows=0)
+    original_cols = list(header_df.columns)
+    log(f"Header columns detected: {len(original_cols):,}", indent=1)
+    colmap: Dict[str, str] = {}
+    for c in original_cols:
+        colmap[clean_col_name(c)] = c
+    return [clean_col_name(c) for c in original_cols], colmap
+
+
+def detect_features(header_cols_clean: List[str], include_features: Optional[str], exclude_features: Optional[str]) -> List[str]:
+    cols = set(header_cols_clean)
+    if include_features:
+        wanted = [clean_col_name(x) for x in include_features.split(",") if x.strip()]
+    else:
+        wanted = [f for f in DEFAULT_FEATURES if f in cols]
+        # Conservative auto-add for engineering/configuration fields, not *_DB.
+        skip = set(DATE_CANDIDATES + META_COLS + ["ECGI", "USID", "ON_AIR", "LAST_DB_MISMATCH", "DB_MISMATCH", "DELTA", "DELTA_STATUS_COLOR"])
+        for c in header_cols_clean:
+            if c.endswith("_DB") or c in wanted or c in skip:
+                continue
+            if is_numeric_config_col(c) or "NEIGHBOR" in c or c in {"CELLNAME", "CELLTYPE", "GEOTYPE"}:
+                wanted.append(c)
+
+    exclude = {clean_col_name(x) for x in exclude_features.split(",") if x.strip()} if exclude_features else set()
+    return [f for f in wanted if f in cols and not f.endswith("_DB") and f not in exclude]
+
+
+def load_feature_rules(defaults_json: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    rules = json.loads(json.dumps(BUILTIN_FEATURE_RULES))
+    if defaults_json:
+        p = Path(defaults_json).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"--defaults-json file not found: {p}")
+        extra = json.loads(p.read_text(encoding="utf-8"))
+        for k, v in extra.items():
+            fk = clean_col_name(k)
+            current = rules.get(fk, {})
+            current.update(v or {})
+            rules[fk] = current
+
+    for f, cfg in rules.items():
+        vals = cfg.get("default_values", []) or []
+        cfg["default_values_norm"] = sorted({normalize_value_text(x) for x in vals if normalize_value_text(x)})
+    return rules
+
+
+def get_feature_weight(feature: str, rules: Dict[str, Dict[str, Any]]) -> float:
+    return float(rules.get(clean_col_name(feature), {}).get("criticality_weight", 5.0))
+
+
+def value_is_default(feature: str, value: object, rules: Dict[str, Dict[str, Any]]) -> int:
+    f = clean_col_name(feature)
+    v = normalize_value_text(value)
+    defaults = set(rules.get(f, {}).get("default_values_norm", []))
+    return int(bool(v and v in defaults))
+
+
+def value_is_invalid(feature: str, value: object, rules: Dict[str, Dict[str, Any]]) -> int:
+    f = clean_col_name(feature)
+    cfg = rules.get(f, {})
+    if "valid_min" not in cfg and "valid_max" not in cfg:
+        return 0
+    v = normalize_value_text(value)
+    if not v:
+        return 0
+    try:
+        x = float(v)
+    except Exception:
+        return 0
+    if "valid_min" in cfg and x < float(cfg["valid_min"]):
+        return 1
+    if "valid_max" in cfg and x > float(cfg["valid_max"]):
+        return 1
+    return 0
+
+
+# ==========================================================
+# Phase 1A: latest-day DB_MISMATCH candidate gate
+# ==========================================================
+
+
+def create_latest_db_mismatch_candidates(
+    con,
+    input_path: Path,
+    colmap: Dict[str, str],
+    date_col_clean: str,
+    days: int,
+    end_date: Optional[str],
+    server_id_filter: Optional[str],
+) -> Dict[str, Any]:
+    header("PHASE 1A - LATEST-DAY DB_MISMATCH CANDIDATE EXTRACTION")
+    if "DB_MISMATCH" not in colmap:
+        raise ValueError(
+            "DB_MISMATCH column is required for V4 candidate gating. "
+            "Your older V3 source-only mode can run without it, but V4 intentionally starts from latest-day DB_MISMATCH='YES'."
+        )
+
+    file_sql = sql_path(input_path)
+    date_expr = date_parse_expr(colmap[date_col_clean])
+    ecgi_expr = ecgi_expr_from_columns(colmap)
+    db_mismatch_expr = compact_norm_expr(quote_ident(colmap["DB_MISMATCH"]))
+
+    meta_selects = []
+    for m in META_COLS:
+        if m in colmap:
+            meta_selects.append(f"{compact_norm_expr(quote_ident(colmap[m]))} AS {quote_ident(m)}")
+        else:
+            meta_selects.append(f"NULL AS {quote_ident(m)}")
+    meta_sql = ",\n            ".join(meta_selects)
+
+    stats_sql = f"""
+    WITH raw AS (
+        SELECT {date_expr} AS LOAD_DATE
+        FROM read_csv_auto({file_sql}, HEADER=TRUE, ALL_VARCHAR=TRUE, SAMPLE_SIZE=100000, IGNORE_ERRORS=TRUE)
+    )
+    SELECT MIN(LOAD_DATE) AS MIN_LOAD_DATE,
+           MAX(LOAD_DATE) AS MAX_LOAD_DATE,
+           COUNT(DISTINCT LOAD_DATE) AS DISTINCT_LOAD_DAYS
+    FROM raw
+    WHERE LOAD_DATE IS NOT NULL
+    """
+    stats = con.execute(stats_sql).fetchdf()
+    if stats.empty or pd.isna(stats.loc[0, "MAX_LOAD_DATE"]):
+        raise RuntimeError("Could not parse valid LOAD_DATE values from input CSV.")
+
+    raw_min_date = pd.to_datetime(stats.loc[0, "MIN_LOAD_DATE"]).normalize()
+    raw_max_date = pd.to_datetime(stats.loc[0, "MAX_LOAD_DATE"]).normalize()
+    max_date = pd.to_datetime(end_date).normalize() if end_date else raw_max_date
+    min_date = max_date - pd.Timedelta(days=int(days) - 1)
+
+    log(
+        f"Detected raw date range: {raw_min_date.date()} to {raw_max_date.date()}; "
+        f"distinct load days={int(stats.loc[0, 'DISTINCT_LOAD_DAYS'])}",
+        indent=1,
+    )
+    log(f"Analysis window selected: {min_date.date()} to {max_date.date()} ({days} requested days)", indent=1)
+    log(f"Latest candidate date: {max_date.date()}", indent=1)
+
+    server_filter_sql = ""
+    if server_id_filter:
+        server_filter_sql = f"AND SERVER_ID = {sql_string(server_id_filter.strip().upper())}"
+
+    con.execute("DROP TABLE IF EXISTS candidate_ecgis")
+    candidate_sql = f"""
+    CREATE TABLE candidate_ecgis AS
+    WITH raw AS (
+        SELECT
+            {date_expr} AS LOAD_DATE,
+            {ecgi_expr} AS ECGI,
+            {meta_sql},
+            {db_mismatch_expr} AS DB_MISMATCH
+        FROM read_csv_auto({file_sql}, HEADER=TRUE, ALL_VARCHAR=TRUE, SAMPLE_SIZE=100000, IGNORE_ERRORS=TRUE)
+    ), latest_mismatch_rows AS (
+        SELECT *
+        FROM raw
+        WHERE LOAD_DATE = DATE {sql_string(str(max_date.date()))}
+          AND DB_MISMATCH = 'YES'
+          AND ECGI IS NOT NULL AND ECGI <> ''
+          {server_filter_sql}
+    )
+    SELECT
+        ECGI,
+        ANY_VALUE(REGION) AS REGION,
+        ANY_VALUE(MARKETCLUSTER) AS MARKETCLUSTER,
+        ANY_VALUE(MARKET) AS MARKET,
+        ANY_VALUE(SUBMARKET) AS SUBMARKET,
+        ANY_VALUE(SERVER_ID) AS SERVER_ID,
+        COUNT(*) AS LATEST_DB_MISMATCH_RAW_ROWS,
+        DATE {sql_string(str(max_date.date()))} AS LATEST_CANDIDATE_DATE
+    FROM latest_mismatch_rows
+    GROUP BY ECGI
+    """
+    con.execute(candidate_sql)
+
+    raw_latest_stats_sql = f"""
+    WITH raw AS (
+        SELECT
+            {date_expr} AS LOAD_DATE,
+            {ecgi_expr} AS ECGI,
+            {meta_sql},
+            {db_mismatch_expr} AS DB_MISMATCH
+        FROM read_csv_auto({file_sql}, HEADER=TRUE, ALL_VARCHAR=TRUE, SAMPLE_SIZE=100000, IGNORE_ERRORS=TRUE)
+    )
+    SELECT
+        COUNT(*) AS LATEST_RAW_ROWS,
+        SUM(CASE WHEN DB_MISMATCH = 'YES' THEN 1 ELSE 0 END) AS LATEST_DB_MISMATCH_YES_ROWS,
+        COUNT(DISTINCT ECGI) FILTER (WHERE DB_MISMATCH = 'YES') AS LATEST_DB_MISMATCH_YES_ECGIS
+    FROM raw
+    WHERE LOAD_DATE = DATE {sql_string(str(max_date.date()))}
+      {server_filter_sql}
+    """
+    raw_latest_stats = con.execute(raw_latest_stats_sql).fetchdf().iloc[0].to_dict()
+    candidate_count = int(con.execute("SELECT COUNT(*) FROM candidate_ecgis").fetchone()[0] or 0)
+    log(f"Latest-day raw rows scanned: {int(raw_latest_stats.get('LATEST_RAW_ROWS') or 0):,}", indent=1)
+    log(f"Latest-day DB_MISMATCH='YES' raw rows: {int(raw_latest_stats.get('LATEST_DB_MISMATCH_YES_ROWS') or 0):,}", indent=1)
+    log(f"Distinct candidate ECGIs: {candidate_count:,}", indent=1)
+
+    if candidate_count == 0:
+        raise RuntimeError(
+            f"No candidate ECGIs found for LOAD_DATE={max_date.date()} with DB_MISMATCH='YES'. "
+            "Check --end-date, date parsing, DB_MISMATCH values, and --server-id."
+        )
+
+    return {
+        "script_version": SCRIPT_VERSION,
+        "input_file": str(input_path),
+        "requested_days": int(days),
+        "window_start_date": str(min_date.date()),
+        "window_end_date": str(max_date.date()),
+        "candidate_date": str(max_date.date()),
+        "raw_min_load_date": str(raw_min_date.date()),
+        "raw_max_load_date": str(raw_max_date.date()),
+        "raw_distinct_load_days": int(stats.loc[0, "DISTINCT_LOAD_DAYS"]),
+        "server_id_filter": server_id_filter or "",
+        "latest_raw_rows": int(raw_latest_stats.get("LATEST_RAW_ROWS") or 0),
+        "latest_db_mismatch_yes_rows": int(raw_latest_stats.get("LATEST_DB_MISMATCH_YES_ROWS") or 0),
+        "latest_db_mismatch_candidate_ecgis": candidate_count,
+        "ranking_mode": "latest-day DB_MISMATCH ECGI gate + source-history only; *_DB fields not compared",
+    }
+
+
+# ==========================================================
+# Phase 1C: 30-day source history for candidate ECGIs
+# ==========================================================
+
+
+def create_event_tables(con) -> None:
+    con.execute("DROP TABLE IF EXISTS source_change_events")
+    con.execute(
+        """
+        CREATE TABLE source_change_events (
+            ECGI VARCHAR,
+            FEATURE VARCHAR,
+            LOAD_DATE DATE,
+            PREVIOUS_LOAD_DATE DATE,
+            PREVIOUS_SOURCE_VALUE VARCHAR,
+            CURRENT_SOURCE_VALUE VARCHAR,
+            RAW_ROWS_PER_ECGI_DATE BIGINT,
+            SOURCE_VALUES_UNIQUE_COUNT BIGINT,
+            REGION VARCHAR,
+            MARKETCLUSTER VARCHAR,
+            MARKET VARCHAR,
+            SUBMARKET VARCHAR,
+            SERVER_ID VARCHAR,
+            A_B_A_REVERT_FLAG INTEGER
+        )
+        """
+    )
+
+    con.execute("DROP TABLE IF EXISTS source_same_day_conflicts")
+    con.execute(
+        """
+        CREATE TABLE source_same_day_conflicts (
+            ECGI VARCHAR,
+            FEATURE VARCHAR,
+            LOAD_DATE DATE,
+            REPRESENTATIVE_SOURCE_VALUE VARCHAR,
+            SOURCE_VALUES_UNIQUE_COUNT BIGINT,
+            RAW_ROWS_PER_ECGI_DATE BIGINT,
+            REGION VARCHAR,
+            MARKETCLUSTER VARCHAR,
+            MARKET VARCHAR,
+            SUBMARKET VARCHAR,
+            SERVER_ID VARCHAR
+        )
+        """
+    )
+
+    con.execute("DROP TABLE IF EXISTS source_feature_history_metrics")
+    con.execute(
+        """
+        CREATE TABLE source_feature_history_metrics (
+            ECGI VARCHAR,
+            FEATURE VARCHAR,
+            REGION VARCHAR,
+            MARKETCLUSTER VARCHAR,
+            MARKET VARCHAR,
+            SUBMARKET VARCHAR,
+            SERVER_ID VARCHAR,
+            OBSERVED_DAYS_FOR_FEATURE BIGINT,
+            FIRST_OBSERVED_DATE DATE,
+            LAST_OBSERVED_DATE DATE,
+            FIRST_SOURCE_VALUE VARCHAR,
+            LATEST_SOURCE_VALUE VARCHAR,
+            PREVIOUS_NONLATEST_SOURCE_VALUE VARCHAR,
+            DISTINCT_SOURCE_VALUES_30D BIGINT,
+            MODE_SOURCE_VALUE VARCHAR,
+            MODE_SOURCE_VALUE_DAYS BIGINT,
+            MODE_SOURCE_VALUE_SHARE_PERCENT DOUBLE,
+            LATEST_SOURCE_VALUE_DAYS BIGINT,
+            LATEST_SOURCE_VALUE_FIRST_SEEN_DATE DATE,
+            LATEST_SOURCE_VALUE_LAST_SEEN_DATE DATE,
+            RAW_ROWS_FOR_FEATURE BIGINT
+        )
+        """
+    )
+
+
+def insert_history_metrics_for_feature(con, feature: str) -> None:
+    fq_val = quote_ident(feature + "__VALUE")
+    fsql = sql_string(feature)
+    insert_sql = f"""
+    INSERT INTO source_feature_history_metrics
+    WITH daily AS (
+        SELECT
+            ECGI,
+            LOAD_DATE,
+            {fq_val} AS SOURCE_VALUE,
+            RAW_ROWS_PER_ECGI_DATE,
+            REGION,
+            MARKETCLUSTER,
+            MARKET,
+            SUBMARKET,
+            SERVER_ID
+        FROM feature_daily_batch
+        WHERE {fq_val} IS NOT NULL
+    ), agg AS (
+        SELECT
+            ECGI,
+            ANY_VALUE(REGION) AS REGION,
+            ANY_VALUE(MARKETCLUSTER) AS MARKETCLUSTER,
+            ANY_VALUE(MARKET) AS MARKET,
+            ANY_VALUE(SUBMARKET) AS SUBMARKET,
+            ANY_VALUE(SERVER_ID) AS SERVER_ID,
+            COUNT(*) AS OBSERVED_DAYS_FOR_FEATURE,
+            MIN(LOAD_DATE) AS FIRST_OBSERVED_DATE,
+            MAX(LOAD_DATE) AS LAST_OBSERVED_DATE,
+            COUNT(DISTINCT SOURCE_VALUE) AS DISTINCT_SOURCE_VALUES_30D,
+            SUM(RAW_ROWS_PER_ECGI_DATE) AS RAW_ROWS_FOR_FEATURE
+        FROM daily
+        GROUP BY ECGI
+    ), first_value AS (
+        SELECT ECGI, SOURCE_VALUE AS FIRST_SOURCE_VALUE
+        FROM (
+            SELECT ECGI, SOURCE_VALUE, LOAD_DATE,
+                   ROW_NUMBER() OVER (PARTITION BY ECGI ORDER BY LOAD_DATE ASC, SOURCE_VALUE ASC) AS rn
+            FROM daily
+        ) x
+        WHERE rn = 1
+    ), latest_value AS (
+        SELECT ECGI, SOURCE_VALUE AS LATEST_SOURCE_VALUE
+        FROM (
+            SELECT ECGI, SOURCE_VALUE, LOAD_DATE,
+                   ROW_NUMBER() OVER (PARTITION BY ECGI ORDER BY LOAD_DATE DESC, SOURCE_VALUE ASC) AS rn
+            FROM daily
+        ) x
+        WHERE rn = 1
+    ), previous_nonlatest AS (
+        SELECT ECGI, SOURCE_VALUE AS PREVIOUS_NONLATEST_SOURCE_VALUE
+        FROM (
+            SELECT d.ECGI, d.SOURCE_VALUE, d.LOAD_DATE,
+                   ROW_NUMBER() OVER (PARTITION BY d.ECGI ORDER BY d.LOAD_DATE DESC, d.SOURCE_VALUE ASC) AS rn
+            FROM daily d
+            JOIN latest_value l ON d.ECGI = l.ECGI
+            WHERE d.SOURCE_VALUE <> l.LATEST_SOURCE_VALUE
+        ) x
+        WHERE rn = 1
+    ), value_counts AS (
+        SELECT
+            ECGI,
+            SOURCE_VALUE,
+            COUNT(*) AS VALUE_DAYS,
+            MIN(LOAD_DATE) AS VALUE_FIRST_SEEN_DATE,
+            MAX(LOAD_DATE) AS VALUE_LAST_SEEN_DATE
+        FROM daily
+        GROUP BY ECGI, SOURCE_VALUE
+    ), mode_value AS (
+        SELECT ECGI,
+               SOURCE_VALUE AS MODE_SOURCE_VALUE,
+               VALUE_DAYS AS MODE_SOURCE_VALUE_DAYS
+        FROM (
+            SELECT ECGI, SOURCE_VALUE, VALUE_DAYS,
+                   ROW_NUMBER() OVER (PARTITION BY ECGI ORDER BY VALUE_DAYS DESC, SOURCE_VALUE ASC) AS rn
+            FROM value_counts
+        ) x
+        WHERE rn = 1
+    ), latest_counts AS (
+        SELECT
+            v.ECGI,
+            v.VALUE_DAYS AS LATEST_SOURCE_VALUE_DAYS,
+            v.VALUE_FIRST_SEEN_DATE AS LATEST_SOURCE_VALUE_FIRST_SEEN_DATE,
+            v.VALUE_LAST_SEEN_DATE AS LATEST_SOURCE_VALUE_LAST_SEEN_DATE
+        FROM value_counts v
+        JOIN latest_value l
+          ON v.ECGI = l.ECGI AND v.SOURCE_VALUE = l.LATEST_SOURCE_VALUE
+    )
+    SELECT
+        a.ECGI,
+        {fsql} AS FEATURE,
+        a.REGION,
+        a.MARKETCLUSTER,
+        a.MARKET,
+        a.SUBMARKET,
+        a.SERVER_ID,
+        a.OBSERVED_DAYS_FOR_FEATURE,
+        a.FIRST_OBSERVED_DATE,
+        a.LAST_OBSERVED_DATE,
+        f.FIRST_SOURCE_VALUE,
+        l.LATEST_SOURCE_VALUE,
+        p.PREVIOUS_NONLATEST_SOURCE_VALUE,
+        a.DISTINCT_SOURCE_VALUES_30D,
+        m.MODE_SOURCE_VALUE,
+        m.MODE_SOURCE_VALUE_DAYS,
+        100.0 * COALESCE(m.MODE_SOURCE_VALUE_DAYS, 0) / NULLIF(a.OBSERVED_DAYS_FOR_FEATURE, 0) AS MODE_SOURCE_VALUE_SHARE_PERCENT,
+        lc.LATEST_SOURCE_VALUE_DAYS,
+        lc.LATEST_SOURCE_VALUE_FIRST_SEEN_DATE,
+        lc.LATEST_SOURCE_VALUE_LAST_SEEN_DATE,
+        a.RAW_ROWS_FOR_FEATURE
+    FROM agg a
+    LEFT JOIN first_value f ON a.ECGI = f.ECGI
+    LEFT JOIN latest_value l ON a.ECGI = l.ECGI
+    LEFT JOIN previous_nonlatest p ON a.ECGI = p.ECGI
+    LEFT JOIN mode_value m ON a.ECGI = m.ECGI
+    LEFT JOIN latest_counts lc ON a.ECGI = lc.ECGI
+    """
+    con.execute(insert_sql)
+
+
+def create_candidate_source_history_events_batched(
+    con,
+    input_path: Path,
+    colmap: Dict[str, str],
+    date_col_clean: str,
+    features: List[str],
+    analysis_info: Dict[str, Any],
+    latlon_decimals: int,
+    feature_batch_size: int,
+) -> None:
+    header("PHASE 1C - BUILD 30-DAY SOURCE HISTORY FOR CANDIDATE ECGIS")
+    log("Only latest-day DB_MISMATCH candidate ECGIs are pulled into the 30-day history scan.", indent=1)
+    log("FEATURE_DB columns are intentionally not used for scoring in this V4 source-history version.", indent=1)
+
+    file_sql = sql_path(input_path)
+    date_expr = date_parse_expr(colmap[date_col_clean])
+    ecgi_sql = ecgi_expr_from_columns(colmap)
+    min_date_sql = analysis_info["window_start_date"]
+    max_date_sql = analysis_info["window_end_date"]
+
+    create_event_tables(con)
+
+    meta_selects = []
+    for m in META_COLS:
+        if m in colmap:
+            meta_selects.append(f"{compact_norm_expr(quote_ident(colmap[m]))} AS {quote_ident(m)}")
+        else:
+            meta_selects.append(f"NULL AS {quote_ident(m)}")
+
+    batches = chunks_list(features, feature_batch_size)
+    log(f"Processing {len(features)} feature(s) in {len(batches)} batch(es); feature_batch_size={feature_batch_size}", indent=1)
+
+    total_daily_rows = 0
+    for batch_no, batch in enumerate(batches, start=1):
+        log(f"Feature batch {batch_no}/{len(batches)}: {', '.join(batch)}", indent=1)
+        batch_start = time.time()
+
+        feature_selects = [f"{feature_norm_expr(colmap[f], f, latlon_decimals)} AS {quote_ident(f)}" for f in batch]
+        raw_cte_select = ",\n                ".join(
+            [
+                f"{date_expr} AS LOAD_DATE",
+                f"{ecgi_sql} AS ECGI",
+                *meta_selects,
+                *feature_selects,
+            ]
+        )
+
+        agg_parts = [
+            "ANY_VALUE(REGION) AS REGION",
+            "ANY_VALUE(MARKETCLUSTER) AS MARKETCLUSTER",
+            "ANY_VALUE(MARKET) AS MARKET",
+            "ANY_VALUE(SUBMARKET) AS SUBMARKET",
+            "ANY_VALUE(SERVER_ID) AS SERVER_ID",
+            "COUNT(*) AS RAW_ROWS_PER_ECGI_DATE",
+        ]
+        for f in batch:
+            fq = quote_ident(f)
+            agg_parts.append(f"MIN({fq}) FILTER (WHERE {fq} IS NOT NULL) AS {quote_ident(f + '__VALUE')}")
+            agg_parts.append(f"COUNT(DISTINCT {fq}) FILTER (WHERE {fq} IS NOT NULL) AS {quote_ident(f + '__UNIQUE_COUNT')}")
+        agg_sql = ",\n            ".join(agg_parts)
+
+        con.execute("DROP TABLE IF EXISTS feature_daily_batch")
+        create_batch_sql = f"""
+        CREATE TEMPORARY TABLE feature_daily_batch AS
+        WITH raw AS (
+            SELECT
+                {raw_cte_select}
+            FROM read_csv_auto({file_sql}, HEADER=TRUE, ALL_VARCHAR=TRUE, SAMPLE_SIZE=100000, IGNORE_ERRORS=TRUE)
+        ), filtered AS (
+            SELECT r.*
+            FROM raw r
+            JOIN candidate_ecgis c ON r.ECGI = c.ECGI
+            WHERE r.LOAD_DATE BETWEEN DATE {sql_string(min_date_sql)} AND DATE {sql_string(max_date_sql)}
+              AND r.ECGI IS NOT NULL AND r.ECGI <> ''
+        )
+        SELECT
+            LOAD_DATE,
+            ECGI,
+            {agg_sql}
+        FROM filtered
+        GROUP BY LOAD_DATE, ECGI
+        """
+        con.execute(create_batch_sql)
+        daily_rows = int(con.execute("SELECT COUNT(*) FROM feature_daily_batch").fetchone()[0] or 0)
+        total_daily_rows += daily_rows
+        log(f"Candidate ECGI/day rows in batch: {daily_rows:,}", indent=2)
+
+        for f in batch:
+            log(f"Extracting history metrics/events for {f}", indent=2)
+            val = quote_ident(f + "__VALUE")
+            uniq = quote_ident(f + "__UNIQUE_COUNT")
+            fsql = sql_string(f)
+
+            insert_history_metrics_for_feature(con, f)
+
+            change_sql = f"""
+            INSERT INTO source_change_events
+            SELECT
+                ECGI,
+                {fsql} AS FEATURE,
+                LOAD_DATE,
+                PREVIOUS_LOAD_DATE,
+                PREVIOUS_SOURCE_VALUE,
+                CURRENT_SOURCE_VALUE,
+                RAW_ROWS_PER_ECGI_DATE,
+                SOURCE_VALUES_UNIQUE_COUNT,
+                REGION,
+                MARKETCLUSTER,
+                MARKET,
+                SUBMARKET,
+                SERVER_ID,
+                CASE
+                    WHEN TWO_OBS_BACK_SOURCE_VALUE IS NOT NULL
+                     AND CURRENT_SOURCE_VALUE = TWO_OBS_BACK_SOURCE_VALUE
+                     AND CURRENT_SOURCE_VALUE <> PREVIOUS_SOURCE_VALUE
+                    THEN 1 ELSE 0
+                END AS A_B_A_REVERT_FLAG
+            FROM (
+                SELECT
+                    ECGI,
+                    LOAD_DATE,
+                    LAG(LOAD_DATE) OVER (PARTITION BY ECGI ORDER BY LOAD_DATE) AS PREVIOUS_LOAD_DATE,
+                    LAG({val}) OVER (PARTITION BY ECGI ORDER BY LOAD_DATE) AS PREVIOUS_SOURCE_VALUE,
+                    LAG({val}, 2) OVER (PARTITION BY ECGI ORDER BY LOAD_DATE) AS TWO_OBS_BACK_SOURCE_VALUE,
+                    {val} AS CURRENT_SOURCE_VALUE,
+                    RAW_ROWS_PER_ECGI_DATE,
+                    {uniq} AS SOURCE_VALUES_UNIQUE_COUNT,
+                    REGION,
+                    MARKETCLUSTER,
+                    MARKET,
+                    SUBMARKET,
+                    SERVER_ID
+                FROM feature_daily_batch
+                WHERE {val} IS NOT NULL
+            ) x
+            WHERE PREVIOUS_SOURCE_VALUE IS NOT NULL
+              AND CURRENT_SOURCE_VALUE <> PREVIOUS_SOURCE_VALUE
+            """
+            con.execute(change_sql)
+
+            conflict_sql = f"""
+            INSERT INTO source_same_day_conflicts
+            SELECT
+                ECGI,
+                {fsql} AS FEATURE,
+                LOAD_DATE,
+                {val} AS REPRESENTATIVE_SOURCE_VALUE,
+                {uniq} AS SOURCE_VALUES_UNIQUE_COUNT,
+                RAW_ROWS_PER_ECGI_DATE,
+                REGION,
+                MARKETCLUSTER,
+                MARKET,
+                SUBMARKET,
+                SERVER_ID
+            FROM feature_daily_batch
+            WHERE COALESCE({uniq}, 0) > 1
+            """
+            con.execute(conflict_sql)
+
+        changes_count = int(con.execute("SELECT COUNT(*) FROM source_change_events").fetchone()[0] or 0)
+        conflicts_count = int(con.execute("SELECT COUNT(*) FROM source_same_day_conflicts").fetchone()[0] or 0)
+        hist_count = int(con.execute("SELECT COUNT(*) FROM source_feature_history_metrics").fetchone()[0] or 0)
+        con.execute("DROP TABLE IF EXISTS feature_daily_batch")
+        log(
+            f"Batch complete in {time.time() - batch_start:.1f}s; cumulative changes={changes_count:,}; "
+            f"conflicts={conflicts_count:,}; feature-history rows={hist_count:,}",
+            indent=1,
+        )
+
+    log(f"Total candidate ECGI/day rows processed across batches: {total_daily_rows:,}", indent=1)
+
+
+# ==========================================================
+# Phase 1D/E/F: metrics, rules, suppressors, scoring
+# ==========================================================
+
+
+def load_compact_tables(con) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    header("PHASE 1D - LOAD COMPACT HISTORY TABLES FOR RULE SCORING")
+    candidates = con.execute("SELECT * FROM candidate_ecgis").fetchdf()
+    hist = con.execute("SELECT * FROM source_feature_history_metrics").fetchdf()
+    changes = con.execute("SELECT * FROM source_change_events").fetchdf()
+    conflicts = con.execute("SELECT * FROM source_same_day_conflicts").fetchdf()
+
+    for df in [candidates, hist, changes, conflicts]:
+        df.columns = [clean_col_name(c) for c in df.columns]
+        for c in ["LOAD_DATE", "PREVIOUS_LOAD_DATE", "FIRST_OBSERVED_DATE", "LAST_OBSERVED_DATE", "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE", "LATEST_SOURCE_VALUE_LAST_SEEN_DATE", "LATEST_CANDIDATE_DATE"]:
+            if c in df.columns:
+                df[c] = pd.to_datetime(df[c], errors="coerce").dt.normalize()
+        if "ECGI" in df.columns:
+            df["ECGI"] = df["ECGI"].map(normalize_key_value)
+        if "FEATURE" in df.columns:
+            df["FEATURE"] = df["FEATURE"].map(clean_col_name)
+
+    for c in ["FIRST_SOURCE_VALUE", "LATEST_SOURCE_VALUE", "PREVIOUS_NONLATEST_SOURCE_VALUE", "MODE_SOURCE_VALUE", "PREVIOUS_SOURCE_VALUE", "CURRENT_SOURCE_VALUE", "REPRESENTATIVE_SOURCE_VALUE"]:
+        for df in [hist, changes, conflicts]:
+            if c in df.columns:
+                df[c] = df[c].map(normalize_value_text)
+
+    log(f"Candidate ECGIs: {len(candidates):,}", indent=1)
+    log(f"Feature-history metric rows: {len(hist):,}", indent=1)
+    log(f"Source-change event rows: {len(changes):,}", indent=1)
+    log(f"Same-day conflict rows: {len(conflicts):,}", indent=1)
+    return candidates, hist, changes, conflicts
+
+
+def compute_reverse_transition_flags(changes: pd.DataFrame) -> pd.DataFrame:
+    if changes.empty:
+        changes["REVERSE_TRANSITION_FLAG"] = pd.Series(dtype=int)
+        return changes
+    changes = changes.sort_values(["ECGI", "FEATURE", "LOAD_DATE", "PREVIOUS_SOURCE_VALUE", "CURRENT_SOURCE_VALUE"]).reset_index(drop=True)
+    flags: List[int] = []
+    seen: Dict[Tuple[str, str], set] = {}
+    for _, row in changes.iterrows():
+        key = (str(row["ECGI"]), str(row["FEATURE"]))
+        prev = normalize_value_text(row.get("PREVIOUS_SOURCE_VALUE", ""))
+        cur = normalize_value_text(row.get("CURRENT_SOURCE_VALUE", ""))
+        pair = (prev, cur)
+        rev = (cur, prev)
+        flags.append(1 if rev in seen.get(key, set()) else 0)
+        seen.setdefault(key, set()).add(pair)
+    changes["REVERSE_TRANSITION_FLAG"] = flags
+    return changes
+
+
+def build_change_stats(changes: pd.DataFrame, candidate_date: pd.Timestamp, total_candidate_ecgis: int) -> pd.DataFrame:
+    if changes.empty:
+        return pd.DataFrame(columns=["ECGI", "FEATURE"])
+
+    changes = compute_reverse_transition_flags(changes)
+    group = changes.groupby(["ECGI", "FEATURE"], dropna=False)
+    stats = group.agg(
+        SOURCE_CHANGE_COUNT=("LOAD_DATE", "size"),
+        SOURCE_CHANGE_DAYS_COUNT=("LOAD_DATE", "nunique"),
+        SOURCE_FIRST_CHANGE_DATE=("LOAD_DATE", "min"),
+        SOURCE_LAST_CHANGE_DATE=("LOAD_DATE", "max"),
+        SOURCE_A_B_A_REVERT_COUNT=("A_B_A_REVERT_FLAG", "sum"),
+        SOURCE_REVERSE_TRANSITION_COUNT=("REVERSE_TRANSITION_FLAG", "sum"),
+        RAW_ROWS_SUPPORTING_SOURCE_CHANGES=("RAW_ROWS_PER_ECGI_DATE", "sum"),
+        DISTINCT_PREVIOUS_SOURCE_VALUES_COUNT=("PREVIOUS_SOURCE_VALUE", pd.Series.nunique),
+        DISTINCT_CURRENT_SOURCE_VALUES_COUNT=("CURRENT_SOURCE_VALUE", pd.Series.nunique),
+    ).reset_index()
+
+    # Latest change transition per ECGI/feature.
+    latest = changes.sort_values(["ECGI", "FEATURE", "LOAD_DATE"]).groupby(["ECGI", "FEATURE"], as_index=False).tail(1)
+    latest = latest[["ECGI", "FEATURE", "PREVIOUS_SOURCE_VALUE", "CURRENT_SOURCE_VALUE", "LOAD_DATE"]].rename(
+        columns={
+            "PREVIOUS_SOURCE_VALUE": "LATEST_PREVIOUS_SOURCE_VALUE",
+            "CURRENT_SOURCE_VALUE": "LATEST_CURRENT_SOURCE_VALUE",
+            "LOAD_DATE": "LATEST_SOURCE_CHANGE_DATE",
+        }
+    )
+    stats = stats.merge(latest, on=["ECGI", "FEATURE"], how="left")
+
+    # Candidate-bulk stats among candidate ECGIs. This is not the full-server denominator, but it catches
+    # mass refresh patterns inside the latest-mismatch candidate population.
+    bulk = changes.groupby(["FEATURE", "LOAD_DATE"], as_index=False).agg(CHANGED_ECGIS_FEATURE_DAY=("ECGI", "nunique"))
+    if not bulk.empty:
+        denom = max(1, int(total_candidate_ecgis))
+        bulk["CANDIDATE_BULK_CHANGE_RATIO"] = bulk["CHANGED_ECGIS_FEATURE_DAY"] / denom
+        merge_bulk = changes[["ECGI", "FEATURE", "LOAD_DATE"]].merge(bulk, on=["FEATURE", "LOAD_DATE"], how="left")
+        bulk_per_feature = merge_bulk.groupby(["ECGI", "FEATURE"], as_index=False).agg(
+            MAX_CANDIDATE_BULK_CHANGE_RATIO=("CANDIDATE_BULK_CHANGE_RATIO", "max"),
+            MAX_CHANGED_ECGIS_FEATURE_DAY=("CHANGED_ECGIS_FEATURE_DAY", "max"),
+        )
+        stats = stats.merge(bulk_per_feature, on=["ECGI", "FEATURE"], how="left")
+
+    stats["LATEST_DAY_SOURCE_CHANGE_FLAG"] = (
+        pd.to_datetime(stats["SOURCE_LAST_CHANGE_DATE"], errors="coerce").dt.normalize() == candidate_date
+    ).astype(int)
+    stats["SOURCE_LATEST_CHANGE"] = stats.apply(
+        lambda r: transition_text(r.get("LATEST_PREVIOUS_SOURCE_VALUE", ""), r.get("LATEST_CURRENT_SOURCE_VALUE", "")), axis=1
+    )
+    return stats
+
+
+def build_conflict_stats(conflicts: pd.DataFrame) -> pd.DataFrame:
+    if conflicts.empty:
+        return pd.DataFrame(columns=["ECGI", "FEATURE"])
+    stats = conflicts.groupby(["ECGI", "FEATURE"], dropna=False).agg(
+        SOURCE_SAME_DAY_CONFLICT_ROWS=("LOAD_DATE", "size"),
+        SOURCE_SAME_DAY_CONFLICT_DAYS=("LOAD_DATE", "nunique"),
+        SOURCE_FIRST_CONFLICT_DATE=("LOAD_DATE", "min"),
+        SOURCE_LAST_CONFLICT_DATE=("LOAD_DATE", "max"),
+        MAX_SAME_DAY_UNIQUE_SOURCE_VALUES=("SOURCE_VALUES_UNIQUE_COUNT", "max"),
+    ).reset_index()
+    return stats
+
+
+def add_rule_flags_and_scores(
+    feature_metrics: pd.DataFrame,
+    rules: Dict[str, Dict[str, Any]],
+    analysis_info: Dict[str, Any],
+    high_frequency_days: int,
+    high_frequency_distinct_values: int,
+    persistent_days: int,
+    min_reverses_for_backforth: int,
+    min_aba_for_backforth: int,
+    default_min_days: int,
+    stable_change_suppress_days: int,
+    bulk_change_ratio_threshold: float,
+    min_report_score: float,
+) -> pd.DataFrame:
+    if feature_metrics.empty:
+        return feature_metrics
+
+    fm = feature_metrics.copy()
+    numeric_defaults = {
+        "OBSERVED_DAYS_FOR_FEATURE": 0,
+        "DISTINCT_SOURCE_VALUES_30D": 0,
+        "MODE_SOURCE_VALUE_DAYS": 0,
+        "MODE_SOURCE_VALUE_SHARE_PERCENT": 0,
+        "LATEST_SOURCE_VALUE_DAYS": 0,
+        "RAW_ROWS_FOR_FEATURE": 0,
+        "SOURCE_CHANGE_COUNT": 0,
+        "SOURCE_CHANGE_DAYS_COUNT": 0,
+        "SOURCE_A_B_A_REVERT_COUNT": 0,
+        "SOURCE_REVERSE_TRANSITION_COUNT": 0,
+        "RAW_ROWS_SUPPORTING_SOURCE_CHANGES": 0,
+        "DISTINCT_PREVIOUS_SOURCE_VALUES_COUNT": 0,
+        "DISTINCT_CURRENT_SOURCE_VALUES_COUNT": 0,
+        "SOURCE_SAME_DAY_CONFLICT_ROWS": 0,
+        "SOURCE_SAME_DAY_CONFLICT_DAYS": 0,
+        "MAX_SAME_DAY_UNIQUE_SOURCE_VALUES": 0,
+        "LATEST_DAY_SOURCE_CHANGE_FLAG": 0,
+        "MAX_CANDIDATE_BULK_CHANGE_RATIO": 0,
+        "MAX_CHANGED_ECGIS_FEATURE_DAY": 0,
+    }
+    for c, default in numeric_defaults.items():
+        if c not in fm.columns:
+            fm[c] = default
+        fm[c] = safe_numeric(fm[c], default)
+
+    date_cols = [
+        "FIRST_OBSERVED_DATE",
+        "LAST_OBSERVED_DATE",
+        "SOURCE_FIRST_CHANGE_DATE",
+        "SOURCE_LAST_CHANGE_DATE",
+        "LATEST_SOURCE_CHANGE_DATE",
+        "SOURCE_FIRST_CONFLICT_DATE",
+        "SOURCE_LAST_CONFLICT_DATE",
+        "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE",
+        "LATEST_SOURCE_VALUE_LAST_SEEN_DATE",
+    ]
+    for c in date_cols:
+        if c in fm.columns:
+            fm[c] = pd.to_datetime(fm[c], errors="coerce").dt.normalize()
+
+    candidate_date = pd.to_datetime(analysis_info["candidate_date"]).normalize()
+    requested_days = max(1, int(analysis_info.get("requested_days", 30)))
+
+    # Default / invalid latest flags.
+    fm["LATEST_SOURCE_IS_DEFAULT_FLAG"] = fm.apply(lambda r: value_is_default(r["FEATURE"], r.get("LATEST_SOURCE_VALUE", ""), rules), axis=1)
+    fm["PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG"] = fm.apply(
+        lambda r: value_is_default(r["FEATURE"], r.get("PREVIOUS_NONLATEST_SOURCE_VALUE", ""), rules), axis=1
+    )
+    fm["FIRST_SOURCE_IS_DEFAULT_FLAG"] = fm.apply(lambda r: value_is_default(r["FEATURE"], r.get("FIRST_SOURCE_VALUE", ""), rules), axis=1)
+    fm["LATEST_SOURCE_INVALID_RANGE_FLAG"] = fm.apply(lambda r: value_is_invalid(r["FEATURE"], r.get("LATEST_SOURCE_VALUE", ""), rules), axis=1)
+    fm["FEATURE_CRITICALITY_WEIGHT"] = fm["FEATURE"].map(lambda f: get_feature_weight(f, rules))
+
+    fm["SOURCE_CHANGED_DAYS_PERCENT"] = 100.0 * fm["SOURCE_CHANGE_DAYS_COUNT"] / max(1, requested_days)
+    fm["DAYS_SINCE_LAST_SOURCE_CHANGE"] = (
+        candidate_date - pd.to_datetime(fm["SOURCE_LAST_CHANGE_DATE"], errors="coerce").dt.normalize()
+    ).dt.days
+    fm["DAYS_SINCE_LAST_SOURCE_CHANGE"] = fm["DAYS_SINCE_LAST_SOURCE_CHANGE"].fillna(9999).clip(lower=0)
+
+    fm["SOURCE_SAME_DAY_CONFLICT_FLAG"] = (fm["SOURCE_SAME_DAY_CONFLICT_DAYS"] > 0).astype(int)
+    fm["PERSISTENT_SOURCE_INSTABILITY_FLAG"] = (fm["SOURCE_CHANGE_DAYS_COUNT"] >= int(persistent_days)).astype(int)
+
+    # Stricter back-and-forth than V3: one A-B-A is not enough by default.
+    fm["REAL_BACK_AND_FORTH_FLAG"] = (
+        (fm["SOURCE_A_B_A_REVERT_COUNT"] >= int(min_aba_for_backforth))
+        | (fm["SOURCE_REVERSE_TRANSITION_COUNT"] >= int(min_reverses_for_backforth))
+        | ((fm["SOURCE_CHANGE_COUNT"] >= 4) & (fm["DISTINCT_SOURCE_VALUES_30D"] <= 3) & (fm["SOURCE_CHANGE_DAYS_COUNT"] >= 3))
+    ).astype(int)
+
+    fm["HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG"] = (
+        (fm["SOURCE_CHANGE_DAYS_COUNT"] >= int(high_frequency_days))
+        & (fm["DISTINCT_SOURCE_VALUES_30D"] >= int(high_frequency_distinct_values))
+        & (fm["MODE_SOURCE_VALUE_SHARE_PERCENT"] < 85)
+    ).astype(int)
+
+    fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"] = (
+        (fm["LATEST_SOURCE_IS_DEFAULT_FLAG"] == 1)
+        & (fm["PREVIOUS_NONLATEST_SOURCE_VALUE"].fillna("").astype(str) != "")
+        & (fm["PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG"] == 0)
+        & (fm["LATEST_SOURCE_VALUE_DAYS"] >= int(default_min_days))
+    ).astype(int)
+
+    fm["BULK_OR_REFRESH_SUPPRESSOR_FLAG"] = (
+        (fm["MAX_CANDIDATE_BULK_CHANGE_RATIO"] >= float(bulk_change_ratio_threshold))
+        & (fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"] == 0)
+        & (fm["LATEST_SOURCE_INVALID_RANGE_FLAG"] == 0)
+        & (fm["REAL_BACK_AND_FORTH_FLAG"] == 0)
+        & (fm["HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG"] == 0)
+        & (fm["SOURCE_SAME_DAY_CONFLICT_FLAG"] == 0)
+    ).astype(int)
+
+    fm["NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG"] = (
+        (fm["SOURCE_CHANGE_COUNT"] == 1)
+        & (fm["DISTINCT_SOURCE_VALUES_30D"] <= 2)
+        & (fm["DAYS_SINCE_LAST_SOURCE_CHANGE"] >= int(stable_change_suppress_days))
+        & (fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"] == 0)
+        & (fm["LATEST_SOURCE_INVALID_RANGE_FLAG"] == 0)
+        & (fm["SOURCE_SAME_DAY_CONFLICT_FLAG"] == 0)
+    ).astype(int)
+
+    fm["LOW_INFORMATION_STABLE_SOURCE_HISTORY_FLAG"] = (
+        (fm["SOURCE_CHANGE_COUNT"] == 0)
+        & (fm["SOURCE_SAME_DAY_CONFLICT_FLAG"] == 0)
+        & (fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"] == 0)
+        & (fm["LATEST_SOURCE_INVALID_RANGE_FLAG"] == 0)
+    ).astype(int)
+
+    fm["HAS_CRITICAL_PROBLEM_FLAG"] = (
+        (fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"] == 1)
+        | (fm["LATEST_SOURCE_INVALID_RANGE_FLAG"] == 1)
+        | (fm["REAL_BACK_AND_FORTH_FLAG"] == 1)
+        | (fm["HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG"] == 1)
+        | (fm["SOURCE_SAME_DAY_CONFLICT_FLAG"] == 1)
+    ).astype(int)
+
+    # Absolute severity score. The goal is not to rank every change, but to isolate the non-normal candidate history.
+    score = pd.Series(np.zeros(len(fm)), index=fm.index, dtype=float)
+    score += 35.0 * fm["FALLBACK_TO_DEFAULT_VALUE_FLAG"]
+    score += 30.0 * fm["LATEST_SOURCE_INVALID_RANGE_FLAG"]
+    score += 28.0 * fm["REAL_BACK_AND_FORTH_FLAG"]
+    score += 28.0 * fm["HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG"]
+    score += 20.0 * fm["SOURCE_SAME_DAY_CONFLICT_FLAG"]
+    score += 14.0 * fm["PERSISTENT_SOURCE_INSTABILITY_FLAG"]
+    score += 8.0 * fm["LATEST_DAY_SOURCE_CHANGE_FLAG"]
+    score += np.minimum(15.0, 1.5 * fm["SOURCE_CHANGE_DAYS_COUNT"])
+    score += np.minimum(10.0, 0.75 * fm["SOURCE_CHANGE_COUNT"])
+    score += np.minimum(8.0, 2.0 * np.maximum(fm["DISTINCT_SOURCE_VALUES_30D"] - 1, 0))
+    score += np.where(fm["HAS_CRITICAL_PROBLEM_FLAG"] == 1, fm["FEATURE_CRITICALITY_WEIGHT"], 0.25 * fm["FEATURE_CRITICALITY_WEIGHT"])
+    score += np.minimum(5.0, np.log1p(fm["RAW_ROWS_FOR_FEATURE"].clip(lower=0)))
+
+    # Suppressors apply only if no critical problem is present.
+    no_critical = fm["HAS_CRITICAL_PROBLEM_FLAG"] == 0
+    score -= np.where(no_critical & (fm["NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG"] == 1), 25.0, 0.0)
+    score -= np.where(no_critical & (fm["BULK_OR_REFRESH_SUPPRESSOR_FLAG"] == 1), 25.0, 0.0)
+    score -= np.where(no_critical & (fm["LOW_INFORMATION_STABLE_SOURCE_HISTORY_FLAG"] == 1), 18.0, 0.0)
+    fm["SOURCE_PROBLEM_SEVERITY_SCORE"] = score.clip(lower=0)
+    fm["SOURCE_PROBLEM_SEVERITY_PERCENTILE"] = percentile_rank(fm["SOURCE_PROBLEM_SEVERITY_SCORE"])
+
+    def severity_band(x: float) -> str:
+        if x >= 80:
+            return "CRITICAL"
+        if x >= 60:
+            return "HIGH"
+        if x >= 40:
+            return "MEDIUM"
+        if x >= 20:
+            return "LOW"
+        return "SUPPRESSED_OR_INFORMATIONAL"
+
+    fm["SEVERITY_BAND"] = fm["SOURCE_PROBLEM_SEVERITY_SCORE"].map(severity_band)
+
+    def problem_class(r: pd.Series) -> str:
+        # Critical/meaningful categories first.
+        if int(r.get("LATEST_SOURCE_INVALID_RANGE_FLAG", 0)) == 1:
+            return "INVALID_LATEST_SOURCE_VALUE"
+        if int(r.get("FALLBACK_TO_DEFAULT_VALUE_FLAG", 0)) == 1:
+            return "FALLBACK_TO_DEFAULT_VALUE"
+        if int(r.get("REAL_BACK_AND_FORTH_FLAG", 0)) == 1:
+            return "REAL_BACK_AND_FORTH_INSTABILITY"
+        if int(r.get("HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", 0)) == 1:
+            return "HIGH_FREQUENCY_DIFFERENT_VALUES"
+        if int(r.get("SOURCE_SAME_DAY_CONFLICT_FLAG", 0)) == 1:
+            return "SAME_DAY_SOURCE_CONFLICT"
+        if int(r.get("PERSISTENT_SOURCE_INSTABILITY_FLAG", 0)) == 1:
+            return "PERSISTENT_SOURCE_INSTABILITY"
+        if int(r.get("LATEST_DAY_SOURCE_CHANGE_FLAG", 0)) == 1:
+            return "LATEST_DAY_SOURCE_CHANGE"
+        # Suppressed / hold categories.
+        if int(r.get("NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG", 0)) == 1:
+            return "SUPPRESSED_NORMAL_STABLE_SOURCE_CHANGE"
+        if int(r.get("BULK_OR_REFRESH_SUPPRESSOR_FLAG", 0)) == 1:
+            return "SUPPRESSED_BULK_OR_REFRESH_PATTERN"
+        if int(r.get("LOW_INFORMATION_STABLE_SOURCE_HISTORY_FLAG", 0)) == 1:
+            return "DB_MISMATCH_CANDIDATE_STABLE_SOURCE_HISTORY"
+        return "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL"
+
+    fm["PROBLEM_CLASS"] = fm.apply(problem_class, axis=1)
+
+    fm["SUPPRESSION_REASON"] = ""
+    fm.loc[fm["NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG"] == 1, "SUPPRESSION_REASON"] = "NORMAL_STABLE_SOURCE_CHANGE"
+    fm.loc[fm["BULK_OR_REFRESH_SUPPRESSOR_FLAG"] == 1, "SUPPRESSION_REASON"] = "BULK_OR_REFRESH_PATTERN_AMONG_CANDIDATES"
+    fm.loc[fm["LOW_INFORMATION_STABLE_SOURCE_HISTORY_FLAG"] == 1, "SUPPRESSION_REASON"] = "STABLE_SOURCE_HISTORY_AFTER_DB_MISMATCH_GATE"
+    fm.loc[fm["HAS_CRITICAL_PROBLEM_FLAG"] == 1, "SUPPRESSION_REASON"] = ""
+
+    fm["REPORT_FLAG"] = (
+        (fm["SOURCE_PROBLEM_SEVERITY_SCORE"] >= float(min_report_score))
+        & (fm["PROBLEM_CLASS"].str.startswith("SUPPRESSED") == False)
+        & (fm["PROBLEM_CLASS"] != "DB_MISMATCH_CANDIDATE_STABLE_SOURCE_HISTORY")
+    ).astype(int)
+
+    fm["SOURCE_FEATURE_EVIDENCE_SUMMARY"] = fm.apply(
+        lambda r: (
+            f"{r['FEATURE']} latest source={short_value(r.get('LATEST_SOURCE_VALUE',''))}; "
+            f"source changed on {int(r.get('SOURCE_CHANGE_DAYS_COUNT',0))}/{requested_days} days; "
+            f"distinct source values={int(r.get('DISTINCT_SOURCE_VALUES_30D',0))}; "
+            f"class={r['PROBLEM_CLASS']}; severity={float(r['SOURCE_PROBLEM_SEVERITY_SCORE']):.1f}."
+        ),
+        axis=1,
+    )
+
+    fm["RECOMMENDED_ACTION"] = fm["PROBLEM_CLASS"].map(recommended_action).fillna("Review source history and latest DB_MISMATCH context.")
+    return fm.sort_values(["REPORT_FLAG", "SOURCE_PROBLEM_SEVERITY_SCORE"], ascending=[False, False]).reset_index(drop=True)
+
+
+def recommended_action(problem_class: str) -> str:
+    p = str(problem_class or "").upper()
+    if "FALLBACK_TO_DEFAULT" in p:
+        return "Investigate why the latest source value fell back to a known default; validate upstream feed/defaulting logic."
+    if "INVALID_LATEST" in p:
+        return "Validate latest source value against RAN parameter requirements; correct out-of-range value if confirmed."
+    if "BACK_AND_FORTH" in p:
+        return "Investigate repeated reversion/toggling in the source system; check competing loads or automation overwrites."
+    if "HIGH_FREQUENCY" in p:
+        return "Investigate high-frequency multi-value changes; check unstable source feed, repeated imports, or conflicting updates."
+    if "SAME_DAY" in p:
+        return "Investigate multiple same-day source values for the same ECGI/feature; check duplicate feed rows or inconsistent joins."
+    if "PERSISTENT" in p:
+        return "Review persistent source instability and determine whether it is planned network activity or unresolved data quality issue."
+    if "LATEST_DAY" in p:
+        return "Review latest-day source change in the context of the current DB_MISMATCH candidate."
+    if "STABLE_SOURCE" in p:
+        return "Source history is stable; if latest DB_MISMATCH remains important, next step is field-level source-vs-DB analysis."
+    if "SUPPRESSED" in p:
+        return "Suppressed as likely normal/stable or bulk-refresh behavior; keep for audit trace but do not prioritize."
+    return "Manual review recommended."
+
+
+def build_feature_metrics(
+    candidates: pd.DataFrame,
+    hist: pd.DataFrame,
+    changes: pd.DataFrame,
+    conflicts: pd.DataFrame,
+    rules: Dict[str, Dict[str, Any]],
+    analysis_info: Dict[str, Any],
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    header("PHASE 1D/E/F - APPLY ABNORMAL RULES, SUPPRESSORS, AND ABSOLUTE SCORING")
+
+    if hist.empty:
+        raise RuntimeError("No source history metrics were produced for candidate ECGIs.")
+
+    candidate_date = pd.to_datetime(analysis_info["candidate_date"]).normalize()
+    change_stats = build_change_stats(changes, candidate_date, int(analysis_info.get("latest_db_mismatch_candidate_ecgis", 0) or 0))
+    conflict_stats = build_conflict_stats(conflicts)
+
+    fm = hist.copy()
+    if not change_stats.empty:
+        fm = fm.merge(change_stats, on=["ECGI", "FEATURE"], how="left")
+    if not conflict_stats.empty:
+        fm = fm.merge(conflict_stats, on=["ECGI", "FEATURE"], how="left")
+
+    # Candidate latest mismatch support per ECGI.
+    cand_cols = ["ECGI", "LATEST_DB_MISMATCH_RAW_ROWS", "LATEST_CANDIDATE_DATE"]
+    cand_cols += [c for c in META_COLS if c in candidates.columns and c not in fm.columns]
+    fm = fm.merge(candidates[[c for c in cand_cols if c in candidates.columns]], on="ECGI", how="left")
+    fm["ECGI_LABEL"] = fm["ECGI"].map(excel_safe_ecgi)
+    fm["ANALYSIS_DAYS"] = int(analysis_info.get("requested_days", args.days))
+    fm["ANALYSIS_START_DATE"] = analysis_info["window_start_date"]
+    fm["ANALYSIS_END_DATE"] = analysis_info["window_end_date"]
+
+    fm = add_rule_flags_and_scores(
+        feature_metrics=fm,
+        rules=rules,
+        analysis_info=analysis_info,
+        high_frequency_days=args.high_frequency_days,
+        high_frequency_distinct_values=args.high_frequency_distinct_values,
+        persistent_days=args.persistent_days,
+        min_reverses_for_backforth=args.min_reverses_for_backforth,
+        min_aba_for_backforth=args.min_aba_for_backforth,
+        default_min_days=args.default_min_days,
+        stable_change_suppress_days=args.stable_change_suppress_days,
+        bulk_change_ratio_threshold=args.bulk_change_ratio_threshold,
+        min_report_score=args.min_report_score,
+    )
+
+    issue_counts = fm["PROBLEM_CLASS"].value_counts().to_dict()
+    log(f"Feature metric rows scored: {len(fm):,}", indent=1)
+    log(f"Problem-class counts: {issue_counts}", indent=1)
+    log(f"Reportable feature incidents: {int(fm['REPORT_FLAG'].sum()):,}", indent=1)
+    return fm
+
+
+# ==========================================================
+# Phase 1G: ECGI incident summary, reports, outputs
+# ==========================================================
+
+
+def build_ecgi_summary(feature_metrics: pd.DataFrame, candidates: pd.DataFrame, min_report_score: float) -> pd.DataFrame:
+    header("PHASE 1G - BUILD INCIDENT-LEVEL ECGI SUMMARY")
+    fm = feature_metrics.copy()
+    reportable = fm[(fm["REPORT_FLAG"] == 1) & (fm["SOURCE_PROBLEM_SEVERITY_SCORE"] >= float(min_report_score))].copy()
+
+    if reportable.empty:
+        log("No reportable feature incidents after suppressors and severity threshold.", indent=1)
+        return pd.DataFrame()
+
+    # Pick the top feature incident per ECGI.
+    reportable = reportable.sort_values(["ECGI", "SOURCE_PROBLEM_SEVERITY_SCORE"], ascending=[True, False])
+    top = reportable.groupby("ECGI", as_index=False).head(1).copy()
+    top = top.rename(
+        columns={
+            "FEATURE": "MAIN_SOURCE_PROBLEM_FEATURE",
+            "PROBLEM_CLASS": "PRIMARY_SOURCE_PROBLEM",
+            "SOURCE_FEATURE_EVIDENCE_SUMMARY": "MAIN_SOURCE_EVIDENCE_SUMMARY",
+            "SOURCE_PROBLEM_SEVERITY_SCORE": "MAIN_SOURCE_FEATURE_SEVERITY_SCORE",
+            "SOURCE_PROBLEM_SEVERITY_PERCENTILE": "MAIN_SOURCE_FEATURE_SEVERITY_PERCENTILE",
+            "SOURCE_CHANGE_DAYS_COUNT": "MAIN_SOURCE_FEATURE_CHANGED_DAYS_COUNT",
+            "SOURCE_CHANGED_DAYS_PERCENT": "MAIN_SOURCE_FEATURE_CHANGED_DAYS_PERCENT",
+            "SOURCE_FIRST_CHANGE_DATE": "MAIN_SOURCE_FIRST_CHANGE_DATE",
+            "SOURCE_LAST_CHANGE_DATE": "MAIN_SOURCE_LAST_CHANGE_DATE",
+            "SOURCE_LATEST_CHANGE": "MAIN_SOURCE_LATEST_CHANGE",
+        }
+    )
+
+    agg = reportable.groupby("ECGI", as_index=False).agg(
+        SOURCE_CHANGED_FEATURE_COUNT=("FEATURE", "nunique"),
+        REPORTABLE_FEATURE_INCIDENT_COUNT=("FEATURE", "size"),
+        TOTAL_SOURCE_CHANGE_DAYS_ACROSS_FEATURES=("SOURCE_CHANGE_DAYS_COUNT", "sum"),
+        TOTAL_SOURCE_CHANGE_EVENTS=("SOURCE_CHANGE_COUNT", "sum"),
+        MAX_SOURCE_CHANGED_DAYS_SINGLE_FEATURE=("SOURCE_CHANGE_DAYS_COUNT", "max"),
+        SOURCE_BACK_AND_FORTH_FEATURE_COUNT=("REAL_BACK_AND_FORTH_FLAG", "sum"),
+        SOURCE_HIGH_FREQUENCY_FEATURE_COUNT=("HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", "sum"),
+        FALLBACK_TO_DEFAULT_FEATURE_COUNT=("FALLBACK_TO_DEFAULT_VALUE_FLAG", "sum"),
+        INVALID_LATEST_SOURCE_VALUE_FEATURE_COUNT=("LATEST_SOURCE_INVALID_RANGE_FLAG", "sum"),
+        SOURCE_SAME_DAY_CONFLICT_FEATURE_COUNT=("SOURCE_SAME_DAY_CONFLICT_FLAG", "sum"),
+        SOURCE_PERSISTENT_FEATURE_COUNT=("PERSISTENT_SOURCE_INSTABILITY_FLAG", "sum"),
+        LATEST_DAY_SOURCE_CHANGE_FEATURE_COUNT=("LATEST_DAY_SOURCE_CHANGE_FLAG", "sum"),
+        SOURCE_RULE_SCORE_FROM_FEATURES=("SOURCE_PROBLEM_SEVERITY_SCORE", "sum"),
+        MAX_FEATURE_SEVERITY_SCORE=("SOURCE_PROBLEM_SEVERITY_SCORE", "max"),
+    )
+
+    # Top features as compact text.
+    top_feats = (
+        reportable.sort_values(["ECGI", "SOURCE_PROBLEM_SEVERITY_SCORE"], ascending=[True, False])
+        .groupby("ECGI")
+        .head(8)
+        .groupby("ECGI")
+        .apply(lambda d: "; ".join(f"{r.FEATURE}:{r.PROBLEM_CLASS}:{float(r.SOURCE_PROBLEM_SEVERITY_SCORE):.1f}" for r in d.itertuples()))
+        .rename("TOP_SOURCE_CHANGED_FEATURES")
+        .reset_index()
+    )
+
+    keep_top_cols = [
+        "ECGI",
+        "ECGI_LABEL",
+        "REGION",
+        "MARKETCLUSTER",
+        "MARKET",
+        "SUBMARKET",
+        "SERVER_ID",
+        "ANALYSIS_DAYS",
+        "ANALYSIS_START_DATE",
+        "ANALYSIS_END_DATE",
+        "LATEST_DB_MISMATCH_RAW_ROWS",
+        "LATEST_CANDIDATE_DATE",
+        "PRIMARY_SOURCE_PROBLEM",
+        "MAIN_SOURCE_PROBLEM_FEATURE",
+        "MAIN_SOURCE_FEATURE_SEVERITY_SCORE",
+        "MAIN_SOURCE_FEATURE_SEVERITY_PERCENTILE",
+        "MAIN_SOURCE_FEATURE_CHANGED_DAYS_COUNT",
+        "MAIN_SOURCE_FEATURE_CHANGED_DAYS_PERCENT",
+        "MAIN_SOURCE_FIRST_CHANGE_DATE",
+        "MAIN_SOURCE_LAST_CHANGE_DATE",
+        "MAIN_SOURCE_LATEST_CHANGE",
+        "MAIN_SOURCE_EVIDENCE_SUMMARY",
+        "LATEST_SOURCE_VALUE",
+        "PREVIOUS_NONLATEST_SOURCE_VALUE",
+        "FIRST_SOURCE_VALUE",
+        "SEVERITY_BAND",
+        "RECOMMENDED_ACTION",
+    ]
+    top_reduced = top[[c for c in keep_top_cols if c in top.columns]].copy()
+    ecgi = agg.merge(top_reduced, on="ECGI", how="left").merge(top_feats, on="ECGI", how="left")
+
+    ecgi["SOURCE_RULE_SCORE"] = (
+        ecgi["SOURCE_RULE_SCORE_FROM_FEATURES"]
+        + 12.0 * np.maximum(ecgi["SOURCE_CHANGED_FEATURE_COUNT"] - 1, 0)
+        + 20.0 * (ecgi["FALLBACK_TO_DEFAULT_FEATURE_COUNT"] > 0).astype(int)
+        + 15.0 * (ecgi["SOURCE_BACK_AND_FORTH_FEATURE_COUNT"] > 0).astype(int)
+        + 15.0 * (ecgi["SOURCE_HIGH_FREQUENCY_FEATURE_COUNT"] > 0).astype(int)
+    )
+    ecgi["SOURCE_RULE_PERCENTILE"] = percentile_rank(ecgi["SOURCE_RULE_SCORE"])
+    ecgi["FINAL_SOURCE_ANOMALY_SCORE"] = ecgi["SOURCE_RULE_SCORE"]
+    ecgi["FINAL_SOURCE_ANOMALY_PERCENTILE"] = ecgi["SOURCE_RULE_PERCENTILE"]
+    ecgi["MAIN_SOURCE_PROBLEM_TYPE"] = ecgi["PRIMARY_SOURCE_PROBLEM"]
+    ecgi["SOURCE_HISTORY_ISSUE_TYPE"] = ecgi["PRIMARY_SOURCE_PROBLEM"]
+    ecgi["PLAIN_ENGLISH_SUMMARY"] = ecgi.apply(
+        lambda r: (
+            f"{r.get('ECGI_LABEL','')} on server {r.get('SERVER_ID','')} is a latest-day DB_MISMATCH candidate. "
+            f"V4 source-history rules found {int(r.get('REPORTABLE_FEATURE_INCIDENT_COUNT',0))} reportable feature incident(s). "
+            f"Primary class: {r.get('PRIMARY_SOURCE_PROBLEM','')}; main feature: {r.get('MAIN_SOURCE_PROBLEM_FEATURE','')}; "
+            f"absolute severity score={float(r.get('SOURCE_RULE_SCORE',0)):.1f}."
+        ),
+        axis=1,
+    )
+
+    ecgi = ecgi.sort_values("SOURCE_RULE_SCORE", ascending=False).reset_index(drop=True)
+    ecgi.insert(0, "SOURCE_ANOMALY_RANK", np.arange(1, len(ecgi) + 1))
+    log(f"Reportable ECGI incidents: {len(ecgi):,}", indent=1)
+    return ecgi
+
+
+def build_issue_summary(feature_metrics: pd.DataFrame, ecgi_summary: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    if not feature_metrics.empty:
+        fm = feature_metrics.copy()
+        for cls, d in fm.groupby("PROBLEM_CLASS"):
+            rows.append(
+                {
+                    "PROBLEM_CLASS": cls,
+                    "FEATURE_METRIC_ROWS": len(d),
+                    "IMPACTED_ECGI_COUNT": d["ECGI"].nunique(),
+                    "REPORTABLE_ROWS": int(d.get("REPORT_FLAG", pd.Series(dtype=int)).sum()),
+                    "AVG_SEVERITY_SCORE": float(d["SOURCE_PROBLEM_SEVERITY_SCORE"].mean()),
+                    "MAX_SEVERITY_SCORE": float(d["SOURCE_PROBLEM_SEVERITY_SCORE"].max()),
+                }
+            )
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values(["REPORTABLE_ROWS", "MAX_SEVERITY_SCORE"], ascending=[False, False])
+    return out
+
+
+def build_top_event_evidence(changes: pd.DataFrame, conflicts: pd.DataFrame, feature_metrics: pd.DataFrame, evidence_top_n: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    top_pairs = feature_metrics[feature_metrics["REPORT_FLAG"] == 1].sort_values("SOURCE_PROBLEM_SEVERITY_SCORE", ascending=False)
+    top_pairs = top_pairs[["ECGI", "FEATURE", "SOURCE_PROBLEM_SEVERITY_SCORE", "PROBLEM_CLASS"]].head(evidence_top_n).copy()
+    if top_pairs.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    change_ev = pd.DataFrame()
+    if not changes.empty:
+        change_ev = changes.merge(top_pairs[["ECGI", "FEATURE", "PROBLEM_CLASS", "SOURCE_PROBLEM_SEVERITY_SCORE"]], on=["ECGI", "FEATURE"], how="inner")
+        change_ev["ECGI_LABEL"] = change_ev["ECGI"].map(excel_safe_ecgi)
+        change_ev = change_ev.sort_values(["SOURCE_PROBLEM_SEVERITY_SCORE", "ECGI", "FEATURE", "LOAD_DATE"], ascending=[False, True, True, True])
+
+    conflict_ev = pd.DataFrame()
+    if not conflicts.empty:
+        conflict_ev = conflicts.merge(top_pairs[["ECGI", "FEATURE", "PROBLEM_CLASS", "SOURCE_PROBLEM_SEVERITY_SCORE"]], on=["ECGI", "FEATURE"], how="inner")
+        conflict_ev["ECGI_LABEL"] = conflict_ev["ECGI"].map(excel_safe_ecgi)
+        conflict_ev = conflict_ev.sort_values(["SOURCE_PROBLEM_SEVERITY_SCORE", "ECGI", "FEATURE", "LOAD_DATE"], ascending=[False, True, True, True])
+
+    return change_ev, conflict_ev
+
+
+def write_manual_markdown(out_dir: Path, ecgi_summary: pd.DataFrame, feature_metrics: pd.DataFrame, top_n: int) -> None:
+    lines: List[str] = []
+    lines.append("# CESMLC V4 Problem-Focused Manual Review Report")
+    lines.append("")
+    lines.append("This report starts from latest-day `DB_MISMATCH='YES'` ECGIs and uses 30-day source history only.")
+    lines.append("It intentionally does not compare source fields to `_DB` fields in this V4 pass.")
+    lines.append("")
+
+    if ecgi_summary.empty:
+        lines.append("No reportable ECGI incidents passed the configured severity/suppressor rules.")
+        (out_dir / "cesmlc_v4_top_manual_review_report.md").write_text("\n".join(lines), encoding="utf-8")
+        return
+
+    for _, r in ecgi_summary.head(top_n).iterrows():
+        ecgi = r.get("ECGI", "")
+        lines.append(f"## Rank {int(r.get('SOURCE_ANOMALY_RANK', 0))}: {r.get('ECGI_LABEL', '')}")
+        lines.append("")
+        lines.append(f"- **Server / market**: {r.get('SERVER_ID','')} / {r.get('MARKET','')}")
+        lines.append(f"- **Primary class**: {r.get('PRIMARY_SOURCE_PROBLEM','')}")
+        lines.append(f"- **Main feature**: {r.get('MAIN_SOURCE_PROBLEM_FEATURE','')}")
+        lines.append(f"- **Severity score**: {float(r.get('SOURCE_RULE_SCORE',0)):.1f} ({r.get('SEVERITY_BAND','')})")
+        lines.append(f"- **Latest source value**: {short_value(r.get('LATEST_SOURCE_VALUE',''))}")
+        lines.append(f"- **Previous non-latest source value**: {short_value(r.get('PREVIOUS_NONLATEST_SOURCE_VALUE',''))}")
+        lines.append(f"- **Latest source change**: {r.get('MAIN_SOURCE_LATEST_CHANGE','')}")
+        lines.append(f"- **Evidence**: {r.get('MAIN_SOURCE_EVIDENCE_SUMMARY','')}")
+        lines.append(f"- **Recommended action**: {r.get('RECOMMENDED_ACTION','')}")
+        sub = feature_metrics[(feature_metrics["ECGI"] == ecgi) & (feature_metrics["REPORT_FLAG"] == 1)].sort_values("SOURCE_PROBLEM_SEVERITY_SCORE", ascending=False).head(6)
+        if not sub.empty:
+            lines.append("- **Top feature incidents**:")
+            for _, fr in sub.iterrows():
+                lines.append(
+                    f"  - {fr.get('FEATURE','')}: {fr.get('PROBLEM_CLASS','')} | "
+                    f"score={float(fr.get('SOURCE_PROBLEM_SEVERITY_SCORE',0)):.1f} | "
+                    f"latest={short_value(fr.get('LATEST_SOURCE_VALUE',''))} | "
+                    f"changes={int(fr.get('SOURCE_CHANGE_DAYS_COUNT',0))} days | "
+                    f"distinct={int(fr.get('DISTINCT_SOURCE_VALUES_30D',0))}"
+                )
+        lines.append("")
+
+    (out_dir / "cesmlc_v4_top_manual_review_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_readme(out_dir: Path, analysis_info: Dict[str, Any], args: argparse.Namespace) -> None:
+    text = f"""# CESMLC V4 Problem-Focused Results Guide
+
+## What this version does
+
+V4 changes the target from "all source-history changes" to "latest-day DB_MISMATCH candidates with abnormal source history".
+
+Pipeline:
+
+1. Latest-day candidate gate: `DB_MISMATCH = 'YES'`.
+2. Pull 30-day source history for those candidate ECGIs only.
+3. Do not compare `FEATURE` to `FEATURE_DB` in this version.
+4. Apply stricter abnormal-pattern rules:
+   - `FALLBACK_TO_DEFAULT_VALUE`
+   - `REAL_BACK_AND_FORTH_INSTABILITY`
+   - `HIGH_FREQUENCY_DIFFERENT_VALUES`
+   - `SAME_DAY_SOURCE_CONFLICT`
+   - `PERSISTENT_SOURCE_INSTABILITY`
+   - `LATEST_DAY_SOURCE_CHANGE`
+   - `INVALID_LATEST_SOURCE_VALUE`
+5. Suppress likely normal/stable source changes and candidate-population bulk refresh patterns.
+6. Score with an absolute severity score before percentile ranking.
+
+## Important limitation
+
+This version uses `DB_MISMATCH` only as the latest-day ECGI candidate gate. It does not use field-level `_DB` values. Therefore, it cannot conclusively identify "audit cannot push to server". If many candidates fall into `DB_MISMATCH_CANDIDATE_STABLE_SOURCE_HISTORY`, the next step is to add field-level source-vs-DB comparison for those candidates only.
+
+## Run settings
+
+- Script version: `{SCRIPT_VERSION}`
+- Input: `{analysis_info.get('input_file','')}`
+- Window: `{analysis_info.get('window_start_date','')}` to `{analysis_info.get('window_end_date','')}`
+- Candidate date: `{analysis_info.get('candidate_date','')}`
+- Latest-day DB_MISMATCH YES rows: `{analysis_info.get('latest_db_mismatch_yes_rows','')}`
+- Candidate ECGIs: `{analysis_info.get('latest_db_mismatch_candidate_ecgis','')}`
+- Min report score: `{args.min_report_score}`
+- Back-and-forth thresholds: A-B-A >= `{args.min_aba_for_backforth}`, reverse transitions >= `{args.min_reverses_for_backforth}`
+- High-frequency thresholds: changed days >= `{args.high_frequency_days}`, distinct values >= `{args.high_frequency_distinct_values}`
+- Bulk suppressor threshold among candidates: `{args.bulk_change_ratio_threshold}`
+
+## Main files to open
+
+1. `cesmlc_v4_ecgi_incident_summary_top.csv`  
+   Top ECGI-level incidents after suppressors and absolute scoring.
+
+2. `cesmlc_v4_feature_incidents_top.csv`  
+   Top ECGI + feature incidents.
+
+3. `cesmlc_v4_top_manual_review_report.md`  
+   Human-readable top incident review.
+
+4. `cesmlc_v4_issue_type_summary.csv`  
+   Counts by problem class.
+
+5. `cesmlc_v4_suppressed_or_informational_feature_rows.csv`  
+   Rows suppressed as normal/stable/bulk or stable-source history after DB_MISMATCH gate.
+
+6. `cesmlc_v4_candidate_ecgis_latest_db_mismatch.csv`  
+   Distinct latest-day DB_MISMATCH candidate ECGIs.
+
+## Compatibility files for current Phase 2
+
+For compatibility with your current Phase 2 loader, V4 also writes:
+
+- `cesmlc_source_only_ecgi_anomaly_summary_all.csv`
+- `cesmlc_source_only_feature_metrics_all.csv`
+
+These are populated from V4 reportable incidents, not from the old broad V3 source-only change detector.
+"""
+    (out_dir / "00_READ_ME_V4_PROBLEM_FOCUSED.md").write_text(text, encoding="utf-8")
+
+
+def ensure_compatibility_columns(ecgi_summary: pd.DataFrame, feature_metrics: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    ecgi = ecgi_summary.copy()
+    fm = feature_metrics.copy()
+
+    if not ecgi.empty:
+        ecgi_defaults = {
+            "PRIMARY_SOURCE_PROBLEM": "",
+            "MAIN_SOURCE_PROBLEM_TYPE": "",
+            "SOURCE_HISTORY_ISSUE_TYPE": "",
+            "MAIN_SOURCE_PROBLEM_FEATURE": "",
+            "MAIN_SOURCE_EVIDENCE_SUMMARY": "",
+            "MAIN_SOURCE_LATEST_CHANGE": "",
+            "TOP_SOURCE_CHANGED_FEATURES": "",
+            "PLAIN_ENGLISH_SUMMARY": "",
+            "RECOMMENDED_ACTION": "",
+            "SOURCE_RULE_SCORE": 0,
+            "SOURCE_RULE_PERCENTILE": 0,
+            "FINAL_SOURCE_ANOMALY_SCORE": 0,
+            "FINAL_SOURCE_ANOMALY_PERCENTILE": 0,
+        }
+        for c, v in ecgi_defaults.items():
+            if c not in ecgi.columns:
+                ecgi[c] = v
+
+    if not fm.empty:
+        rename_map = {
+            "REAL_BACK_AND_FORTH_FLAG": "SOURCE_BACK_AND_FORTH_FLAG",
+            "HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG": "SOURCE_HIGH_FREQUENCY_FLAG",
+            "PERSISTENT_SOURCE_INSTABILITY_FLAG": "SOURCE_PERSISTENT_FLAG",
+            "SOURCE_PROBLEM_SEVERITY_SCORE": "SOURCE_FEATURE_SCORE",
+            "SOURCE_PROBLEM_SEVERITY_PERCENTILE": "SOURCE_FEATURE_SCORE_PERCENTILE",
+            "PROBLEM_CLASS": "SOURCE_HISTORY_ISSUE_TYPE",
+        }
+        for src, dst in rename_map.items():
+            if src in fm.columns and dst not in fm.columns:
+                fm[dst] = fm[src]
+        defaults = {
+            "SOURCE_CHANGE_COUNT": 0,
+            "SOURCE_CHANGE_DAYS_COUNT": 0,
+            "SOURCE_A_B_A_REVERT_COUNT": 0,
+            "SOURCE_REVERSE_TRANSITION_COUNT": 0,
+            "SOURCE_SAME_DAY_CONFLICT_DAYS": 0,
+            "SOURCE_SAME_DAY_CONFLICT_ROWS": 0,
+            "RARE_LATEST_SOURCE_VALUE_FLAG": 0,
+            "LATEST_DAY_SOURCE_CHANGE_FLAG": 0,
+            "SOURCE_FEATURE_SCORE": 0,
+            "SOURCE_FEATURE_SCORE_PERCENTILE": 0,
+        }
+        for c, v in defaults.items():
+            if c not in fm.columns:
+                fm[c] = v
+
+    return ecgi, fm
+
+
+def write_outputs(
+    out_dir: Path,
+    analysis_info: Dict[str, Any],
+    args: argparse.Namespace,
+    candidates: pd.DataFrame,
+    feature_metrics: pd.DataFrame,
+    ecgi_summary: pd.DataFrame,
+    issue_summary: pd.DataFrame,
+    changes: pd.DataFrame,
+    conflicts: pd.DataFrame,
+) -> None:
+    header("PHASE 1G - WRITE OUTPUTS")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Writing output files to: {out_dir}", indent=1)
+
+    write_readme(out_dir, analysis_info, args)
+    pd.DataFrame([analysis_info]).to_csv(out_dir / "cesmlc_v4_processing_report.csv", index=False)
+    candidates.to_csv(out_dir / "cesmlc_v4_candidate_ecgis_latest_db_mismatch.csv", index=False)
+    issue_summary.to_csv(out_dir / "cesmlc_v4_issue_type_summary.csv", index=False)
+
+    reportable_fm = feature_metrics[feature_metrics["REPORT_FLAG"] == 1].sort_values("SOURCE_PROBLEM_SEVERITY_SCORE", ascending=False).copy()
+    suppressed_fm = feature_metrics[feature_metrics["REPORT_FLAG"] == 0].sort_values("SOURCE_PROBLEM_SEVERITY_SCORE", ascending=False).copy()
+
+    reportable_fm.to_csv(out_dir / "cesmlc_v4_feature_incidents_all.csv", index=False)
+    reportable_fm.head(args.top_n_features).to_csv(out_dir / "cesmlc_v4_feature_incidents_top.csv", index=False)
+    suppressed_fm.to_csv(out_dir / "cesmlc_v4_suppressed_or_informational_feature_rows.csv", index=False)
+
+    if not ecgi_summary.empty:
+        ecgi_summary.to_csv(out_dir / "cesmlc_v4_ecgi_incident_summary_all.csv", index=False)
+        ecgi_summary.head(args.top_n).to_csv(out_dir / "cesmlc_v4_ecgi_incident_summary_top.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(out_dir / "cesmlc_v4_ecgi_incident_summary_all.csv", index=False)
+        pd.DataFrame().to_csv(out_dir / "cesmlc_v4_ecgi_incident_summary_top.csv", index=False)
+
+    change_ev, conflict_ev = build_top_event_evidence(changes, conflicts, feature_metrics, args.evidence_top_n)
+    change_ev.to_csv(out_dir / "cesmlc_v4_source_change_events_top.csv", index=False)
+    conflict_ev.to_csv(out_dir / "cesmlc_v4_same_day_conflicts_top.csv", index=False)
+
+    # Current Phase 2 compatibility aliases. These aliases contain V4 reportable incidents, not old V3 broad source-only rows.
+    compat_ecgi, compat_fm = ensure_compatibility_columns(ecgi_summary, reportable_fm)
+    compat_ecgi.to_csv(out_dir / "cesmlc_source_only_ecgi_anomaly_summary_all.csv", index=False)
+    compat_fm.to_csv(out_dir / "cesmlc_source_only_feature_metrics_all.csv", index=False)
+
+    write_manual_markdown(out_dir, ecgi_summary, feature_metrics, args.manual_report_top_n)
+
+    log(f"Reportable feature incidents written: {len(reportable_fm):,}", indent=1)
+    log(f"Suppressed/informational feature rows written: {len(suppressed_fm):,}", indent=1)
+    log(f"Reportable ECGI incidents written: {len(ecgi_summary):,}", indent=1)
+
+
+# ==========================================================
+# CLI
+# ==========================================================
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="CESMLC V4 problem-focused latest-day DB_MISMATCH candidate + source-history anomaly detector."
+    )
+    p.add_argument("--input", required=True, type=str, help="Raw CESMLC CSV input.")
+    p.add_argument("--days", default=30, type=int, help="Analysis window length ending at --end-date or max LOAD_DATE.")
+    p.add_argument("--end-date", default=None, type=str, help="Optional candidate/latest date YYYY-MM-DD. Default: max parsed LOAD_DATE.")
+    p.add_argument("--out-dir", default=None, type=str, help="Output folder.")
+    p.add_argument("--server-id", default=None, type=str, help="Optional SERVER_ID filter for latest-day candidate extraction.")
+    p.add_argument("--include-features", default=",".join(DEFAULT_FEATURES), type=str, help="Comma-separated source/current feature columns to analyze.")
+    p.add_argument("--exclude-features", default=None, type=str, help="Comma-separated features to exclude.")
+    p.add_argument("--defaults-json", default=None, type=str, help="Optional JSON overriding default values, valid ranges, and criticality weights.")
+
+    p.add_argument("--latlon-decimals", default=5, type=int, help="Coordinate rounding precision. Default 5.")
+    p.add_argument("--feature-batch-size", default=1, type=int, help="Number of features per DuckDB batch. Default 1 for memory safety.")
+    p.add_argument("--threads", default=1, type=int, help="DuckDB thread count. Default 1 for memory safety.")
+    p.add_argument("--memory-limit", default="6GB", type=str, help="DuckDB memory limit, e.g. 6GB, 8GB, 16GB.")
+    p.add_argument("--duckdb-file", default=None, type=str, help="Optional DuckDB database file. Default: output/temp/cesmlc_v4.duckdb")
+    p.add_argument("--duckdb-temp-dir", default=None, type=str, help="DuckDB spill/temp directory. Default: output/temp/duckdb_spill")
+    p.add_argument("--keep-duckdb", action="store_true", help="Keep temporary DuckDB files.")
+
+    # Rule thresholds.
+    p.add_argument("--high-frequency-days", default=5, type=int, help="Changed days threshold for high-frequency different-values class.")
+    p.add_argument("--high-frequency-distinct-values", default=3, type=int, help="Distinct values threshold for high-frequency different-values class.")
+    p.add_argument("--persistent-days", default=10, type=int, help="Changed days threshold for persistent source instability.")
+    p.add_argument("--min-reverses-for-backforth", default=2, type=int, help="Reverse transition threshold for real back-and-forth.")
+    p.add_argument("--min-aba-for-backforth", default=2, type=int, help="A-B-A revert threshold for real back-and-forth.")
+    p.add_argument("--default-min-days", default=2, type=int, help="Latest default value must persist this many observed days for fallback class.")
+    p.add_argument("--stable-change-suppress-days", default=5, type=int, help="Suppress one-time changes older than this many days.")
+    p.add_argument("--bulk-change-ratio-threshold", default=0.25, type=float, help="Suppress likely bulk/refresh when candidate-population feature/day change ratio exceeds this.")
+    p.add_argument("--min-report-score", default=35.0, type=float, help="Minimum absolute feature severity score to report.")
+
+    p.add_argument("--top-n", default=300, type=int, help="Top N ECGI incidents output.")
+    p.add_argument("--top-n-features", default=2000, type=int, help="Top N feature incidents output.")
+    p.add_argument("--evidence-top-n", default=2000, type=int, help="Top ECGI-feature pairs for event evidence outputs.")
+    p.add_argument("--manual-report-top-n", default=50, type=int, help="Top ECGIs in manual markdown report.")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    input_path = Path(args.input).expanduser()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    out_dir = Path(args.out_dir).expanduser() if args.out_dir else input_path.parent / "cesmlc_v4_problem_focused_outputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = out_dir / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_path = Path(args.duckdb_file).expanduser() if args.duckdb_file else temp_dir / "cesmlc_v4.duckdb"
+    duckdb_temp_dir = Path(args.duckdb_temp_dir).expanduser() if args.duckdb_temp_dir else temp_dir / "duckdb_spill"
+
+    header("CESMLC V4 PROBLEM-FOCUSED SOURCE-HISTORY DETECTOR")
+    log(f"Input: {input_path}")
+    log(f"Output: {out_dir}")
+    log("Candidate gate: latest-day DB_MISMATCH='YES'")
+    log("Scoring evidence: 30-day source/current value history only; FEATURE_DB columns not compared")
+    log(
+        f"Run settings: days={args.days}, feature_batch_size={args.feature_batch_size}, "
+        f"threads={args.threads}, memory_limit={args.memory_limit}, latlon_decimals={args.latlon_decimals}"
+    )
+
+    header_cols, colmap = read_header(input_path)
+    date_col = first_existing(header_cols, DATE_CANDIDATES)
+    if not date_col:
+        raise ValueError(f"No date column found. Tried {DATE_CANDIDATES}. Found: {header_cols}")
+    features = detect_features(header_cols, args.include_features, args.exclude_features)
+    if not features:
+        raise ValueError("No source features selected. Use --include-features with comma-separated column names.")
+    missing = [f for f in features if f not in colmap]
+    if missing:
+        raise ValueError(f"Selected features not found in CSV header: {missing}")
+
+    log(f"Date column: {date_col}")
+    log(f"DB_MISMATCH column present: {'DB_MISMATCH' in colmap}")
+    log(f"Source features ({len(features)}): {', '.join(features)}")
+
+    rules = load_feature_rules(args.defaults_json)
+    con = open_duckdb(duckdb_path, args.threads, args.memory_limit, duckdb_temp_dir=duckdb_temp_dir)
+    try:
+        analysis_info = create_latest_db_mismatch_candidates(
+            con=con,
+            input_path=input_path,
+            colmap=colmap,
+            date_col_clean=date_col,
+            days=args.days,
+            end_date=args.end_date,
+            server_id_filter=args.server_id,
+        )
+        analysis_info["feature_count"] = int(len(features))
+        analysis_info["features"] = ",".join(features)
+        analysis_info["latlon_decimals"] = int(args.latlon_decimals)
+        analysis_info["min_report_score"] = float(args.min_report_score)
+        analysis_info["high_frequency_days"] = int(args.high_frequency_days)
+        analysis_info["high_frequency_distinct_values"] = int(args.high_frequency_distinct_values)
+        analysis_info["persistent_days"] = int(args.persistent_days)
+        analysis_info["min_reverses_for_backforth"] = int(args.min_reverses_for_backforth)
+        analysis_info["min_aba_for_backforth"] = int(args.min_aba_for_backforth)
+        analysis_info["default_min_days"] = int(args.default_min_days)
+        analysis_info["stable_change_suppress_days"] = int(args.stable_change_suppress_days)
+        analysis_info["bulk_change_ratio_threshold"] = float(args.bulk_change_ratio_threshold)
+
+        create_candidate_source_history_events_batched(
+            con=con,
+            input_path=input_path,
+            colmap=colmap,
+            date_col_clean=date_col,
+            features=features,
+            analysis_info=analysis_info,
+            latlon_decimals=args.latlon_decimals,
+            feature_batch_size=args.feature_batch_size,
+        )
+
+        candidates, hist, changes, conflicts = load_compact_tables(con)
+        feature_metrics = build_feature_metrics(
+            candidates=candidates,
+            hist=hist,
+            changes=changes,
+            conflicts=conflicts,
+            rules=rules,
+            analysis_info=analysis_info,
+            args=args,
+        )
+        ecgi_summary = build_ecgi_summary(feature_metrics, candidates, args.min_report_score)
+        issue_summary = build_issue_summary(feature_metrics, ecgi_summary)
+
+        # Update output stats.
+        analysis_info["feature_history_metric_rows"] = int(len(hist))
+        analysis_info["source_change_event_rows"] = int(len(changes))
+        analysis_info["same_day_conflict_rows"] = int(len(conflicts))
+        analysis_info["reportable_feature_incidents"] = int(feature_metrics["REPORT_FLAG"].sum()) if not feature_metrics.empty else 0
+        analysis_info["reportable_ecgi_incidents"] = int(len(ecgi_summary)) if not ecgi_summary.empty else 0
+        analysis_info["suppressed_or_informational_feature_rows"] = int((feature_metrics["REPORT_FLAG"] == 0).sum()) if not feature_metrics.empty else 0
+
+        write_outputs(
+            out_dir=out_dir,
+            analysis_info=analysis_info,
+            args=args,
+            candidates=candidates,
+            feature_metrics=feature_metrics,
+            ecgi_summary=ecgi_summary,
+            issue_summary=issue_summary,
+            changes=changes,
+            conflicts=conflicts,
+        )
+
+    finally:
+        log("Closing DuckDB connection", indent=1)
+        try:
+            con.close()
+        except Exception:
+            pass
+        if not args.keep_duckdb:
+            log("Removing temporary DuckDB files because --keep-duckdb was not used", indent=1)
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        else:
+            log(f"Keeping temporary DuckDB files in: {temp_dir}", indent=1)
+
+    header("DONE")
+    log(f"Total runtime: {elapsed_text()}")
+    log(f"Open first: {out_dir / 'cesmlc_v4_top_manual_review_report.md'}")
+    log(f"Open second: {out_dir / 'cesmlc_v4_ecgi_incident_summary_top.csv'}")
+    log(f"Open third: {out_dir / 'cesmlc_v4_feature_incidents_top.csv'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
