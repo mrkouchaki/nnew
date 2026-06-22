@@ -1,0 +1,235 @@
+
+
+
+SELECT
+    MIN(CALL_DATE_UTC) AS min_date,
+    MAX(CALL_DATE_UTC) AS max_date,
+    COUNT(*) AS row_count
+FROM E911.E911_LTE_LSR_CSR_CD_MV;
+
+daily kpi:
+
+SELECT
+    TRUNC(CALL_DATE_UTC) AS call_date,
+    MARKET,
+    MME_NAME,
+    TAC,
+    USID,
+    SUM(VOLTE_ATTEMPTS) AS volte_attempts,
+    SUM(LSR_CALL_CNT) AS lsr_call_cnt,
+    SUM(P2_SUCCESS_COUNT) AS p2_success_count,
+    SUM(FAIL_LOCATE) AS fail_locate,
+    SUM(E2VALIDATED) AS e2validated,
+    SUM(E2_CALLCOUNTS) AS e2_callcounts,
+    SUM(DR_CNT) AS dr_cnt,
+    SUM(DR_CALL_CNT) AS dr_call_cnt
+FROM E911.E911_LTE_LSR_CSR_CD_MV
+WHERE CALL_DATE_UTC >= TRUNC(SYSDATE) - 30
+GROUP BY
+    TRUNC(CALL_DATE_UTC),
+    MARKET,
+    MME_NAME,
+    TAC,
+    USID
+ORDER BY call_date DESC;
+
+calculated rate:
+
+SELECT
+    TRUNC(CALL_DATE_UTC) AS call_date,
+    MARKET,
+    MME_NAME,
+    TAC,
+    USID,
+
+    SUM(VOLTE_ATTEMPTS) AS volte_attempts,
+    SUM(LSR_CALL_CNT) AS lsr_call_cnt,
+    SUM(P2_SUCCESS_COUNT) AS p2_success_count,
+    SUM(FAIL_LOCATE) AS fail_locate,
+
+    ROUND(SUM(P2_SUCCESS_COUNT) / NULLIF(SUM(VOLTE_ATTEMPTS), 0), 4) AS p2_success_rate,
+    ROUND(SUM(FAIL_LOCATE) / NULLIF(SUM(LSR_CALL_CNT), 0), 4) AS fail_locate_rate,
+
+    SUM(E2VALIDATED) AS e2validated,
+    SUM(E2_CALLCOUNTS) AS e2_callcounts,
+    ROUND(SUM(E2VALIDATED) / NULLIF(SUM(E2_CALLCOUNTS), 0), 4) AS e2_validation_rate,
+
+    SUM(DR_CNT) AS dr_cnt,
+    SUM(DR_CALL_CNT) AS dr_call_cnt,
+    ROUND(SUM(DR_CNT) / NULLIF(SUM(DR_CALL_CNT), 0), 4) AS dr_rate
+FROM E911.E911_LTE_LSR_CSR_CD_MV
+WHERE CALL_DATE_UTC >= TRUNC(SYSDATE) - 30
+GROUP BY
+    TRUNC(CALL_DATE_UTC),
+    MARKET,
+    MME_NAME,
+    TAC,
+    USID
+HAVING SUM(LSR_CALL_CNT) > 0
+ORDER BY fail_locate_rate DESC, lsr_call_cnt DESC;
+
+
+problem2:
+
+SELECT
+    TRUNC(PULLDATE) AS pull_date,
+    MARKET,
+    ERROR_CODE,
+    ERRORTYPENAME,
+    ERRORCATEGORYDESCSHORT,
+    SEVERITY,
+    IS911AFFECTED,
+    CUSTOMERAFFECTING,
+    COUNT(*) AS issue_count
+FROM E911.E911_GMLC_MISS_DETAILS
+WHERE PULLDATE >= TRUNC(SYSDATE) - 30
+GROUP BY
+    TRUNC(PULLDATE),
+    MARKET,
+    ERROR_CODE,
+    ERRORTYPENAME,
+    ERRORCATEGORYDESCSHORT,
+    SEVERITY,
+    IS911AFFECTED,
+    CUSTOMERAFFECTING
+ORDER BY issue_count DESC;
+
+
+ecgi level:
+
+SELECT
+    PULLDATE,
+    ECGI,
+    ECGI_HEX,
+    USID,
+    ENBID,
+    MARKET,
+    TAC,
+    LAC,
+    SECTOR_NAME,
+    ERROR_CODE,
+    SEVERITY,
+    ERRORTYPENAME,
+    ERRORCATEGORYDESCSHORT,
+    PROBLEMDESC,
+    PROBLEMDETAIL,
+    ERRORS_FOUND,
+    IS911AFFECTED,
+    CUSTOMERAFFECTING,
+    AOTS_TICKET_NUMBER,
+    AOTS_TICKET_STATUS
+FROM E911.E911_GMLC_MISS_DETAILS
+WHERE PULLDATE >= TRUNC(SYSDATE) - 30
+ORDER BY PULLDATE DESC, SEVERITY DESC;
+
+
+
+track2,routing:
+
+SELECT
+    TRUNC(CALL_DATE_UTC) AS call_date,
+    MARKET,
+    COUNTY,
+    STATE,
+    MME_NAME,
+    TAC,
+    USID,
+    PSAP_ID,
+    PSAP_NAME,
+    FCC_PSAP_ID,
+    ROUTE_PSAPID,
+    ROUTE_PSAPNAME,
+    ROUTE_FCC_PSAPID,
+    COUNT(*) AS row_count,
+    SUM(LSR_CALL_CNT) AS lsr_call_cnt,
+    SUM(VOLTE_ATTEMPTS) AS volte_attempts,
+    SUM(FAIL_LOCATE) AS fail_locate
+FROM E911.E911_LTE_LSR_CSR_CD_MV
+WHERE CALL_DATE_UTC >= TRUNC(SYSDATE) - 30
+  AND (
+        NVL(TO_CHAR(PSAP_ID), 'X') <> NVL(TO_CHAR(ROUTE_PSAPID), 'X')
+        OR NVL(TO_CHAR(FCC_PSAP_ID), 'X') <> NVL(TO_CHAR(ROUTE_FCC_PSAPID), 'X')
+      )
+GROUP BY
+    TRUNC(CALL_DATE_UTC),
+    MARKET,
+    COUNTY,
+    STATE,
+    MME_NAME,
+    TAC,
+    USID,
+    PSAP_ID,
+    PSAP_NAME,
+    FCC_PSAP_ID,
+    ROUTE_PSAPID,
+    ROUTE_PSAPNAME,
+    ROUTE_FCC_PSAPID
+ORDER BY call_date DESC, fail_locate DESC, lsr_call_cnt DESC;
+
+
+
+next table:
+
+SELECT column_name, data_type
+FROM all_tab_columns
+WHERE owner = 'E911'
+  AND table_name = 'E911_GMLC_PSAP'
+ORDER BY column_id;
+
+SELECT *
+FROM E911.E911_GMLC_PSAP
+WHERE ROWNUM <= 20;
+
+---//----------------------/
+
+1.
+
+SELECT
+    MIN(CALL_DATE_UTC) AS min_call_date,
+    MAX(CALL_DATE_UTC) AS max_call_date,
+    COUNT(*) AS row_count
+FROM E911.E911_LTE_LSR_CSR_CD_MV;
+
+2.
+
+SELECT
+    MARKET,
+    COUNTY,
+    STATE,
+    PSAP_ID,
+    PSAP_NAME,
+    ROUTE_PSAPID,
+    ROUTE_PSAPNAME,
+    COUNT(*) AS row_count,
+    SUM(LSR_CALL_CNT) AS lsr_call_cnt,
+    SUM(FAIL_LOCATE) AS fail_locate
+FROM E911.E911_LTE_LSR_CSR_CD_MV
+WHERE CALL_DATE_UTC >= TRUNC(SYSDATE) - 30
+  AND NVL(TO_CHAR(PSAP_ID), 'X') <> NVL(TO_CHAR(ROUTE_PSAPID), 'X')
+GROUP BY
+    MARKET,
+    COUNTY,
+    STATE,
+    PSAP_ID,
+    PSAP_NAME,
+    ROUTE_PSAPID,
+    ROUTE_PSAPNAME
+ORDER BY fail_locate DESC, lsr_call_cnt DESC;
+
+3.
+
+SELECT column_name, data_type
+FROM all_tab_columns
+WHERE owner = 'E911'
+  AND table_name = 'E911_GMLC_PSAP'
+ORDER BY column_id;
+
+
+
+
+
+
+
+
+
+
