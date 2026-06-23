@@ -12,7 +12,7 @@ python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src
   --threads 1 `
   --feature-batch-size 1 `
   --duckdb-temp-dir "C:\Temp\duckdb_spill_v6_2"
-
+  --keep-duckdb
 
 
 #!/usr/bin/env python
