@@ -125,7 +125,37 @@ WHERE owner = 'E911'
   );
 
 
+&&&&&&&
 
+
+SELECT
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND name = 'WH_UPDATE_CSSNG_DATA_ADDITION'
+  AND type = 'PROCEDURE'
+  AND line BETWEEN 500 AND 620
+ORDER BY line;
+
+
+
+
+SELECT
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND name = 'WH_UPDATE_CSSNG_DATA_ADDITION'
+  AND type = 'PROCEDURE'
+  AND (
+       UPPER(text) LIKE '%RBSS_LATITUDE%'
+    OR UPPER(text) LIKE '%RBSS_LONGITUDE%'
+    OR UPPER(text) LIKE '%CSSNG_DATA_ADDITION_USID_LATLONG%'
+    OR UPPER(text) LIKE '%ATOLL%'
+    OR UPPER(text) LIKE '%SAS%'
+  )
+ORDER BY line;
 
 
 
