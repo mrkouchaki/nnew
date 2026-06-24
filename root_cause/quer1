@@ -188,4 +188,51 @@ ORDER BY rec_date DESC;
 
 
 
+SELECT
+    ecgi_cell_global_identity,
+    rbss_latitude,
+    rbss_longitude,
+    COUNT(*) AS row_count
+FROM E911.CSSNG_DATA_DEEP_STAGING
+WHERE ecgi_cell_global_identity = '310410253519882'
+GROUP BY
+    ecgi_cell_global_identity,
+    rbss_latitude,
+    rbss_longitude
+ORDER BY row_count DESC;
+
+
+
+
+SELECT
+    owner,
+    name,
+    type,
+    COUNT(*) AS hits,
+    MIN(line) AS first_line,
+    MAX(line) AS last_line
+FROM all_source
+WHERE owner = 'E911'
+  AND UPPER(text) LIKE '%CSSNG_DATA_DEEP_STAGING%'
+GROUP BY owner, name, type
+ORDER BY hits DESC;
+
+
+
+SELECT
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND name = '<OBJECT_NAME_FROM_PREVIOUS_QUERY>'
+  AND type = '<TYPE_FROM_PREVIOUS_QUERY>'
+  AND REGEXP_LIKE(
+        UPPER(text),
+        '(INSERT|MERGE|UPDATE|DELETE|TRUNCATE|CSSNG_DATA_DEEP_STAGING|RBSS_LATITUDE|RBSS_LONGITUDE)'
+      )
+ORDER BY line;
+
+
+
+
 
