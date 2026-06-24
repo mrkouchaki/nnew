@@ -159,3 +159,33 @@ ORDER BY line;
 
 
 
+SELECT
+    column_id,
+    column_name
+FROM all_tab_columns
+WHERE owner = 'E911'
+  AND table_name = 'CSSNG_DATA_ADDITION_HISTORY_P'
+  AND REGEXP_LIKE(
+        column_name,
+        '(REC|DATE|ECGI|RBSS|LAT|LON|LONG|USID|SECTOR|CELL)',
+        'i'
+      )
+ORDER BY column_id;
+
+
+SELECT
+    rec_date,
+    ecgi,
+    rbss_latitude,
+    rbss_longitude,
+    antenna_latitude,
+    antenna_longitude,
+    sector_id,
+    usid
+FROM E911.CSSNG_DATA_ADDITION_HISTORY_P
+WHERE ecgi = '310410253519882'
+ORDER BY rec_date DESC;
+
+
+
+
