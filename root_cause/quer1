@@ -1,0 +1,131 @@
+WITH x AS (
+    SELECT
+        TRUNC(pulldate) AS pull_date,
+        ecgi,
+
+        cssng_best_latlong_used,
+        cssng_best_latitude,
+        cssng_best_longitude,
+
+        rbss_latitude,
+        rbss_longitude,
+        slt_latitude,
+        slt_longitude,
+        slt_gps_latitude,
+        slt_gps_longitude,
+        strc_towerlatitude,
+        strc_towerlongitude,
+        enb_latitude,
+        enb_longitude,
+
+        LAG(cssng_best_latlong_used) OVER (ORDER BY TRUNC(pulldate)) AS prev_used,
+        LAG(cssng_best_latitude)     OVER (ORDER BY TRUNC(pulldate)) AS prev_best_lat,
+        LAG(cssng_best_longitude)    OVER (ORDER BY TRUNC(pulldate)) AS prev_best_lon,
+        LAG(rbss_latitude)           OVER (ORDER BY TRUNC(pulldate)) AS prev_rbss_lat,
+        LAG(rbss_longitude)          OVER (ORDER BY TRUNC(pulldate)) AS prev_rbss_lon,
+        LAG(slt_latitude)            OVER (ORDER BY TRUNC(pulldate)) AS prev_slt_lat,
+        LAG(slt_longitude)           OVER (ORDER BY TRUNC(pulldate)) AS prev_slt_lon,
+        LAG(strc_towerlatitude)      OVER (ORDER BY TRUNC(pulldate)) AS prev_strc_lat,
+        LAG(strc_towerlongitude)     OVER (ORDER BY TRUNC(pulldate)) AS prev_strc_lon
+    FROM e911.cssng_lte_data_hist
+    WHERE TO_CHAR(ecgi) = '310410253519882'
+      AND pulldate >= TRUNC(SYSDATE) - 45
+)
+SELECT
+    pull_date,
+    ecgi,
+
+    cssng_best_latlong_used AS selected_source,
+    prev_used,
+
+    cssng_best_latitude,
+    cssng_best_longitude,
+    prev_best_lat,
+    prev_best_lon,
+
+    rbss_latitude,
+    rbss_longitude,
+    prev_rbss_lat,
+    prev_rbss_lon,
+
+    slt_latitude,
+    slt_longitude,
+    prev_slt_lat,
+    prev_slt_lon,
+
+    strc_towerlatitude,
+    strc_towerlongitude,
+    prev_strc_lat,
+    prev_strc_lon,
+
+    CASE
+        WHEN prev_used IS NOT NULL
+             AND NVL(cssng_best_latlong_used, 'NULL') <> NVL(prev_used, 'NULL')
+        THEN 'ROOT = CSSNG SOURCE SELECTION SWITCHED'
+
+        WHEN prev_best_lat IS NOT NULL
+             AND (
+                    NVL(TO_CHAR(cssng_best_latitude), 'NULL') <> NVL(TO_CHAR(prev_best_lat), 'NULL')
+                 OR NVL(TO_CHAR(cssng_best_longitude), 'NULL') <> NVL(TO_CHAR(prev_best_lon), 'NULL')
+             )
+             AND NVL(cssng_best_latlong_used, 'NULL') = NVL(prev_used, 'NULL')
+        THEN 'ROOT = SAME CSSNG SOURCE VALUE CHANGED'
+
+        ELSE 'NO BEST-LATLON CHANGE'
+    END AS root_change_type,
+
+    CASE
+        WHEN NVL(TO_CHAR(rbss_latitude), 'NULL') <> NVL(TO_CHAR(prev_rbss_lat), 'NULL')
+          OR NVL(TO_CHAR(rbss_longitude), 'NULL') <> NVL(TO_CHAR(prev_rbss_lon), 'NULL')
+        THEN 'RBSS_CHANGED'
+        WHEN NVL(TO_CHAR(slt_latitude), 'NULL') <> NVL(TO_CHAR(prev_slt_lat), 'NULL')
+          OR NVL(TO_CHAR(slt_longitude), 'NULL') <> NVL(TO_CHAR(prev_slt_lon), 'NULL')
+        THEN 'SLT_CHANGED'
+        WHEN NVL(TO_CHAR(strc_towerlatitude), 'NULL') <> NVL(TO_CHAR(prev_strc_lat), 'NULL')
+          OR NVL(TO_CHAR(strc_towerlongitude), 'NULL') <> NVL(TO_CHAR(prev_strc_lon), 'NULL')
+        THEN 'STRC_CHANGED'
+        ELSE 'NO_SOURCE_COLUMN_CHANGE'
+    END AS changed_source_column
+FROM x
+ORDER BY pull_date DESC;
+
+
+
+
+SELECT
+    owner,
+    name,
+    type,
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND UPPER(text) LIKE '%CSSNG_DATA_ADDITION%'
+  AND REGEXP_LIKE(
+        UPPER(text),
+        'INSERT|UPDATE|MERGE|DELETE|TRUNCATE'
+      )
+ORDER BY name, type, line;
+
+
+SELECT
+    owner,
+    job_name,
+    enabled,
+    state,
+    job_action,
+    program_name,
+    schedule_name
+FROM all_scheduler_jobs
+WHERE owner = 'E911'
+  AND (
+       UPPER(job_action) LIKE '%CSSNG_DATA_ADDITION%'
+    OR UPPER(job_action) LIKE '%CSSNG_LTE_DATA%'
+    OR UPPER(job_action) LIKE '%OSS_CSS_LAT_LONG_AUDIT%'
+  );
+
+
+
+
+
+
