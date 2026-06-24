@@ -368,7 +368,47 @@ ORDER BY snwflk_load_date DESC;
 
 
 
+@@@$$$$$@@@@@@$$$$$$@@@@
 
+
+SELECT
+    snwflk_load_date,
+    ecgi_cell_global_identity,
+    technology,
+    cell_active,
+    useid,
+    site_id_bbu,
+    soft_sector_id,
+    rbss_latitude,
+    rbss_longitude
+FROM LEVO_REPORTING_PROD_RST.ENMT_BRD_RSTE@SNWFLK_PROD_LEVO
+WHERE ecgi_cell_global_identity = '310410253519882'
+ORDER BY snwflk_load_date DESC;
+
+
+SELECT
+    COUNT(*) AS row_count,
+    COUNT(DISTINCT rbss_latitude || ',' || rbss_longitude) AS distinct_rbss_latlon,
+    MIN(snwflk_load_date) AS min_load_date,
+    MAX(snwflk_load_date) AS max_load_date
+FROM LEVO_REPORTING_PROD_RST.ENMT_BRD_RSTE@SNWFLK_PROD_LEVO
+WHERE ecgi_cell_global_identity = '310410253519882';
+
+
+
+
+SELECT
+    rec_date,
+    ecgi,
+    rbss_latitude,
+    rbss_longitude,
+    antenna_latitude,
+    antenna_longitude,
+    sector_id,
+    usid
+FROM E911.CSSNG_DATA_ADDITION_HISTORY_P
+WHERE ecgi = '310410253519882'
+ORDER BY rec_date DESC;
 
 
 
