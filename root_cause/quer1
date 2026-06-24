@@ -332,3 +332,48 @@ WHERE owner = 'E911'
   )
 ORDER BY object_type, object_name;
 
+
+
+
+
+SELECT line, text
+FROM all_source
+WHERE owner = 'E911'
+  AND name = 'LOAD_CSSNG_LEVO_SNW_DATA'
+  AND (
+       UPPER(text) LIKE '%INSERT%'
+    OR UPPER(text) LIKE '%CSSNG_LEVO%'
+    OR UPPER(text) LIKE '%SNWFLK%'
+    OR UPPER(text) LIKE '%SNOW%'
+    OR UPPER(text) LIKE '%DATABASE_LINK%'
+    OR UPPER(text) LIKE '%@%'
+  )
+ORDER BY line;
+
+
+
+SELECT
+    snwflk_load_date,
+    ecgi_cell_global_identity,
+    technology,
+    cell_active,
+    useid,
+    site_id_bbu,
+    soft_sector_id,
+    rbss_latitude,
+    rbss_longitude
+FROM E911.CSSNG_LEVO_SNW_STG1
+WHERE ecgi_cell_global_identity = '310410253519882'
+ORDER BY snwflk_load_date DESC;
+
+
+
+
+
+
+
+
+
+
+
+
