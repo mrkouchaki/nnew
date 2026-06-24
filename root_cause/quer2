@@ -1,0 +1,269 @@
+
+
+
+
+/* ============================================================
+   CODE-LINEAGE PROOF FOR CSSNG / LTE LAT-LONG FLOW
+   ============================================================ */
+
+WITH anchors AS (
+    SELECT 1 AS edge_no,
+           'CSSNG_DATA_ADDITION_HISTORY_P <= CSSNG_DATA_ADDITION' AS edge_to_prove,
+           'WH_UPDATE_CSSNG_DATA_ADDITION' AS code_name,
+           'CSSNG_DATA_ADDITION_HISTORY_P' AS anchor_text,
+           15 AS before_n,
+           35 AS after_n
+    FROM dual
+
+    UNION ALL
+    SELECT 2,
+           'CSSNG_DATA_ADDITION <= CSSNG_DATA_ADDITION_STAGING / STAGING2',
+           'WH_UPDATE_CSSNG_DATA_ADDITION',
+           'INSERT INTO CSSNG_DATA_ADDITION',
+           15,
+           45
+    FROM dual
+
+    UNION ALL
+    SELECT 3,
+           'CSSNG_DATA_ADDITION_STAGING/STAGING2 <= CSSNG_LEVO_SNW_STG',
+           'WH_UPDATE_CSSNG_DATA_ADDITION',
+           'CSSNG_LEVO_SNW_STG',
+           15,
+           45
+    FROM dual
+
+    UNION ALL
+    SELECT 4,
+           'CSSNG_LEVO_SNW_STG <= CSSNG_LEVO_SNW_STG1',
+           'WH_UPDATE_CSSNG_DATA_ADDITION',
+           'CSSNG_LEVO_SNW_STG1',
+           20,
+           35
+    FROM dual
+
+    UNION ALL
+    SELECT 5,
+           'CSSNG_LTE_DATA_HIST <= CSSNG_LTE_DATA',
+           'OSS_CSS_LAT_LONG_AUDIT',
+           'CSSNG_LTE_DATA_HIST',
+           15,
+           35
+    FROM dual
+
+    UNION ALL
+    SELECT 6,
+           'CSSNG_LTE_DATA <= CSSNG_DATA_ADDITION + other lookup sources',
+           'OSS_CSS_LAT_LONG_AUDIT',
+           'INSERT INTO CSSNG_LTE_DATA',
+           10,
+           90
+    FROM dual
+
+    UNION ALL
+    SELECT 7,
+           'Old/invalid external Snowflake/LEVO path check',
+           'LOAD_CSSNG_LEVO_SNW_DATA',
+           'SNWFLK_PROD_LEVO',
+           10,
+           25
+    FROM dual
+),
+hits AS (
+    SELECT
+        a.edge_no,
+        a.edge_to_prove,
+        a.before_n,
+        a.after_n,
+        s.owner,
+        s.name,
+        s.type,
+        s.line AS hit_line
+    FROM anchors a
+    JOIN all_source s
+      ON s.owner = 'E911'
+     AND UPPER(s.name) = a.code_name
+     AND UPPER(s.text) LIKE '%' || a.anchor_text || '%'
+),
+windows AS (
+    SELECT
+        edge_no,
+        edge_to_prove,
+        owner,
+        name,
+        type,
+        hit_line,
+        GREATEST(hit_line - before_n, 1) AS start_line,
+        hit_line + after_n AS end_line
+    FROM hits
+)
+SELECT
+    w.edge_no,
+    w.edge_to_prove,
+    w.name AS code_object,
+    w.type AS code_type,
+    w.hit_line,
+    s.line,
+    s.text
+FROM windows w
+JOIN all_source s
+  ON s.owner = w.owner
+ AND s.name  = w.name
+ AND s.type  = w.type
+ AND s.line BETWEEN w.start_line AND w.end_line
+ORDER BY
+    w.edge_no,
+    w.name,
+    w.hit_line,
+    s.line;
+
+
+
+/* ============================================================
+   OBJECT STATUS PROOF
+   ============================================================ */
+
+SELECT
+    owner,
+    object_name,
+    object_type,
+    created,
+    last_ddl_time,
+    status
+FROM all_objects
+WHERE owner = 'E911'
+  AND object_name IN (
+      'WH_UPDATE_CSSNG_DATA_ADDITION',
+      'LOAD_CSSNG_LEVO_SNW_DATA',
+      'OSS_CSS_LAT_LONG_AUDIT',
+      'CSSNG_LEVO_SNW_STG1',
+      'CSSNG_LEVO_SNW_STG',
+      'CSSNG_DATA_ADDITION_STAGING',
+      'CSSNG_DATA_ADDITION_STAGING2',
+      'CSSNG_DATA_ADDITION',
+      'CSSNG_DATA_ADDITION_HISTORY_P',
+      'CSSNG_LTE_DATA',
+      'CSSNG_LTE_DATA_HIST',
+      'ENMT_CESMLC_LTE_AUDIT_P'
+  )
+ORDER BY object_type, object_name;
+
+
+
+
+/* ============================================================
+   WHO REFERENCES THE VISIBLE ROOT TABLE?
+   If this shows only FROM CSSNG_LEVO_SNW_STG1, then Oracle is reading it,
+   not populating it. True loader is external.
+   ============================================================ */
+
+SELECT
+    owner,
+    name,
+    type,
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND UPPER(text) LIKE '%CSSNG_LEVO_SNW_STG1%'
+ORDER BY name, type, line;
+
+
+
+steps:
+
+/* ============================================================
+   ROW-LEVEL PROOF FOR FIRST ECGI
+   Replace ECGI once here if needed.
+   ============================================================ */
+
+SELECT
+    'CSSNG_DATA_ADDITION_HISTORY_P' AS layer_name,
+    rec_date AS load_date,
+    ecgi,
+    rbss_latitude,
+    rbss_longitude,
+    antenna_latitude,
+    antenna_longitude,
+    sector_id,
+    usid
+FROM e911.cssng_data_addition_history_p
+WHERE ecgi = '310410253519882'
+ORDER BY rec_date DESC;
+
+
+SELECT
+    'CSSNG_LTE_DATA_HIST' AS layer_name,
+    pulldate AS load_date,
+    ecgi,
+    cssng_best_latlong_used,
+    cssng_best_latitude,
+    cssng_best_longitude,
+    rbss_latitude,
+    rbss_longitude,
+    slt_latitude,
+    slt_longitude,
+    strc_towerlatitude,
+    strc_towerlongitude
+FROM e911.cssng_lte_data_hist
+WHERE ecgi = '310410253519882'
+ORDER BY pulldate DESC;
+
+
+
+SELECT
+    'ENMT_CESMLC_LTE_AUDIT_P' AS layer_name,
+    enmt_load_date AS load_date,
+    ecgi,
+    antennalat,
+    antennalon,
+    antennalat_db,
+    antennalon_db,
+    db_mismatch,
+    last_db_mismatch,
+    server_id
+FROM e911.enmt_cesmlc_lte_audit_p
+WHERE ecgi = '310410253519882'
+ORDER BY enmt_load_date DESC;
+
+
+SELECT
+    'CSSNG_LEVO_SNW_STG1' AS layer_name,
+    snwflk_load_date,
+    ecgi_cell_global_identity,
+    technology,
+    cell_active,
+    useid,
+    site_id_bbu,
+    soft_sector_id,
+    rbss_latitude,
+    rbss_longitude
+FROM e911.cssng_levo_snw_stg1
+WHERE ecgi_cell_global_identity = '310410253519882'
+
+UNION ALL
+
+SELECT
+    'CSSNG_LEVO_SNW_STG' AS layer_name,
+    snwflk_load_date,
+    ecgi_cell_global_identity,
+    technology,
+    cell_active,
+    useid,
+    site_id_bbu,
+    soft_sector_id,
+    rbss_latitude,
+    rbss_longitude
+FROM e911.cssng_levo_snw_stg
+WHERE ecgi_cell_global_identity = '310410253519882'
+
+ORDER BY layer_name, snwflk_load_date DESC;
+
+
+
+
+
+SELECT
+    COUNT(*) AS row_count
+FROM e911.cssng_data_deep_staging
+WHERE ecgi_cell_global_identity = '310410253519882';
