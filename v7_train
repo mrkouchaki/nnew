@@ -1,0 +1,1773 @@
+
+
+python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection_2\cesmlc_v7_train_problem_state_model.py" `
+  --dataset "C:\Temp\cesmlc_v7_seed_akr3aesme01_30d_outputs\cesmlc_v6_problem_state_training_dataset.csv" `
+  --out-dir "C:\Temp\cesmlc_v7_ml_akr3aesme01_30d_outputs" `
+  --model auto `
+  --test-size 0.25 `
+  --eval-size 0.20 `
+  --min-class-count 20 `
+  --train-verbose 25
+
+
+
+#!/usr/bin/env python
+"""
+CESMLC V6 - Problem-state weak/semi-supervised ML trainer
+==========================================================
+
+Purpose
+-------
+Train and evaluate a real multiclass problem-state model from the V6 seed-label
+training dataset produced by `cesmlc_v6_seed_label_dataset_builder.py`.
+
+Design
+------
+- Seed labels are high-precision weak labels, not treated as perfect truth.
+- Manual labels, if provided, override seed labels and receive higher weight.
+- The model is trained on problem-state feature engineering, not on the final
+  seed-label column itself.
+- By default, direct seed-rule indicator columns are excluded from the ML feature
+  set to avoid simply memorizing the seed-rule decision tree.
+- Optional pseudo-labeling can add high-confidence predictions from hold/unlabeled
+  rows and retrain, giving a semi-supervised workflow.
+
+Supported backends
+------------------
+--model auto           : CatBoost -> LightGBM -> sklearn RandomForest fallback
+--model catboost       : CatBoost multiclass classifier
+--model lightgbm       : LightGBM multiclass classifier
+--model sklearn_rf     : sklearn RandomForest fallback
+--model mlp            : optional PyTorch MLP tabular neural net
+--model tabtransformer : optional PyTorch TabTransformer-style model
+--model fttransformer  : optional PyTorch FT-Transformer-style model
+--model tabnet         : optional pytorch-tabnet backend
+
+Install examples
+----------------
+python -m pip install pandas numpy scikit-learn
+python -m pip install catboost
+python -m pip install lightgbm
+python -m pip install torch
+python -m pip install pytorch-tabnet torch
+
+Example
+-------
+python cesmlc_v6_train_problem_state_model.py ^
+  --dataset "C:\\Temp\\cesmlc_v6_seed_akr3aesme01_30d_outputs\\cesmlc_v6_problem_state_training_dataset.csv" ^
+  --out-dir "C:\\Temp\\cesmlc_v6_ml_akr3aesme01_30d_outputs" ^
+  --model auto ^
+  --test-size 0.25 ^
+  --train-verbose 25
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import pickle
+import re
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "7.0.0-problem-state-weak-semisupervised-ml-simple-fallback"
+NULL_STRINGS = {"", "NULL", "(NULL)", "NAN", "NONE", "NA", "N/A", "<NA>", "-"}
+
+PROBLEM_LABELS = {
+    "AUDIT_PUSH_NOT_APPLIED",
+    "INVALID_LATEST_SOURCE_VALUE",
+    "FALLBACK_TO_DEFAULT_VALUE",  # backward-compatible legacy label
+    "FLUCTUATING_FALLBACK_TO_DEFAULT",
+    "LONG_TERM_FALLBACK_TO_DEFAULT",
+    "REAL_BACK_AND_FORTH_INSTABILITY",
+    "HIGH_FREQUENCY_DIFFERENT_VALUES",
+    "SAME_DAY_SOURCE_CONFLICT",
+    "PERSISTENT_SOURCE_INSTABILITY",
+    "LATEST_DAY_SOURCE_CHANGE",
+}
+SUPPRESSOR_LABELS = {
+    "SUPPRESSED_NORMAL_STABLE_SOURCE_CHANGE",
+    "SUPPRESSED_BULK_OR_REFRESH_PATTERN",
+    "SUPPRESSED_COORDINATED_MULTI_FIELD_CHANGE",
+}
+DEFAULT_HOLD_LABELS = {
+    "DB_PUSH_CHECK_CANDIDATE_STABLE_SOURCE",
+    "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL",
+    "LOW_INFORMATION_STABLE_SOURCE_HISTORY",
+}
+
+RUN_START_TIME = time.time()
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    prefix = "  " * max(0, int(indent))
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {prefix}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def normalize_key_value(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def safe_numeric(s: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(s, pd.Series):
+        s = pd.Series(s)
+    return pd.to_numeric(s, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    if len(s) == 0:
+        return s
+    if s.nunique(dropna=False) <= 1:
+        return pd.Series(np.ones(len(s)) * 50.0, index=s.index)
+    return s.rank(method="average", pct=True) * 100.0
+
+
+def sanitize_label(x: object) -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(x).strip().upper()).strip("_") or "UNKNOWN"
+
+
+def read_csv_clean(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [clean_col_name(c) for c in df.columns]
+    if "ECGI" in df.columns:
+        df["ECGI"] = df["ECGI"].map(normalize_key_value)
+    if "FEATURE" in df.columns:
+        df["FEATURE"] = df["FEATURE"].map(clean_col_name)
+    return df
+
+
+def label_is_nonempty(x: object) -> bool:
+    if pd.isna(x):
+        return False
+    s = str(x).strip()
+    return bool(s and s.upper() not in NULL_STRINGS and s.lower() != "nan")
+
+
+def load_and_prepare_dataset(dataset_path: Path, manual_labels_path: Optional[Path], min_class_count: int, keep_rare_labels: bool, exclude_hold_labels: bool) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    header("STEP 1 - LOAD V6 SEED DATASET AND OPTIONAL MANUAL LABELS")
+    df = read_csv_clean(dataset_path)
+    log(f"Dataset rows loaded: {len(df):,}", indent=1)
+    if "SEED_LABEL" not in df.columns:
+        raise ValueError("Dataset must contain SEED_LABEL. Use output from cesmlc_v6_seed_label_dataset_builder.py.")
+    if "FEATURE" not in df.columns or "ECGI" not in df.columns:
+        raise ValueError("Dataset must contain ECGI and FEATURE columns.")
+
+    df["SEED_LABEL"] = df["SEED_LABEL"].astype(str).map(sanitize_label)
+    if "TRAIN_FOR_MODEL_FLAG" not in df.columns:
+        df["TRAIN_FOR_MODEL_FLAG"] = 1
+    if "TRAINING_WEIGHT" not in df.columns:
+        df["TRAINING_WEIGHT"] = 1.0
+    if "SEED_LABEL_CONFIDENCE" not in df.columns:
+        df["SEED_LABEL_CONFIDENCE"] = 0.50
+
+    df["MANUAL_LABEL"] = df.get("MANUAL_LABEL", "")
+    df["MANUAL_LABEL_NOTES"] = df.get("MANUAL_LABEL_NOTES", "")
+    df["LABEL_SOURCE_FOR_MODEL"] = "seed_label"
+
+    if manual_labels_path:
+        manual = read_csv_clean(manual_labels_path)
+        if "MANUAL_LABEL" not in manual.columns:
+            raise ValueError("Manual label CSV must contain MANUAL_LABEL column.")
+        manual = manual[[c for c in ["ECGI", "FEATURE", "MANUAL_LABEL", "MANUAL_LABEL_NOTES"] if c in manual.columns]].copy()
+        manual = manual[manual["MANUAL_LABEL"].map(label_is_nonempty)].copy()
+        manual["MANUAL_LABEL"] = manual["MANUAL_LABEL"].astype(str).map(sanitize_label)
+        if manual.empty:
+            log("Manual label file was provided but no non-empty MANUAL_LABEL values were found.", indent=1)
+        else:
+            log(f"Manual label rows loaded: {len(manual):,}", indent=1)
+            df = df.merge(manual, on=["ECGI", "FEATURE"], how="left", suffixes=("", "_MANUAL_FILE"))
+            file_label_mask = df.get("MANUAL_LABEL_MANUAL_FILE", pd.Series([np.nan] * len(df))).map(label_is_nonempty)
+            df.loc[file_label_mask, "MANUAL_LABEL"] = df.loc[file_label_mask, "MANUAL_LABEL_MANUAL_FILE"].astype(str).map(sanitize_label)
+            if "MANUAL_LABEL_NOTES_MANUAL_FILE" in df.columns:
+                df.loc[file_label_mask, "MANUAL_LABEL_NOTES"] = df.loc[file_label_mask, "MANUAL_LABEL_NOTES_MANUAL_FILE"].fillna("")
+            df = df.drop(columns=[c for c in ["MANUAL_LABEL_MANUAL_FILE", "MANUAL_LABEL_NOTES_MANUAL_FILE"] if c in df.columns], errors="ignore")
+            log(f"Rows with manual override after merge: {int(df['MANUAL_LABEL'].map(label_is_nonempty).sum()):,}", indent=1)
+
+    manual_mask = df["MANUAL_LABEL"].map(label_is_nonempty)
+    df["FINAL_TRAINING_LABEL"] = np.where(manual_mask, df["MANUAL_LABEL"].astype(str).map(sanitize_label), df["SEED_LABEL"].astype(str).map(sanitize_label))
+    df.loc[manual_mask, "LABEL_SOURCE_FOR_MODEL"] = "manual_label"
+    df.loc[manual_mask, "TRAIN_FOR_MODEL_FLAG"] = 1
+    df.loc[manual_mask, "TRAINING_WEIGHT"] = np.maximum(safe_numeric(df.loc[manual_mask, "TRAINING_WEIGHT"], 1.0), 1.25)
+    df.loc[manual_mask, "SEED_LABEL_CONFIDENCE"] = np.maximum(safe_numeric(df.loc[manual_mask, "SEED_LABEL_CONFIDENCE"], 1.0), 1.0)
+
+    hold_labels = DEFAULT_HOLD_LABELS if exclude_hold_labels else set()
+    train_pool = df[(safe_numeric(df["TRAIN_FOR_MODEL_FLAG"]) == 1) | manual_mask].copy()
+    if hold_labels:
+        before = len(train_pool)
+        train_pool = train_pool[(~train_pool["FINAL_TRAINING_LABEL"].isin(hold_labels)) | (train_pool["LABEL_SOURCE_FOR_MODEL"] == "manual_label")].copy()
+        log(f"Excluded hold/needs-review labels from seed training pool: {before - len(train_pool):,}", indent=1)
+
+    counts = train_pool["FINAL_TRAINING_LABEL"].value_counts()
+    rare = counts[counts < int(min_class_count)]
+    rare_df = rare.rename_axis("FINAL_TRAINING_LABEL").reset_index(name="ROW_COUNT")
+    if not rare.empty and not keep_rare_labels:
+        log(f"Dropping rare labels with < {min_class_count} rows: {rare.to_dict()}", indent=1)
+        train_pool = train_pool[~train_pool["FINAL_TRAINING_LABEL"].isin(rare.index)].copy()
+    elif not rare.empty:
+        log(f"Keeping rare labels despite low count: {rare.to_dict()}", indent=1)
+
+    if train_pool["FINAL_TRAINING_LABEL"].nunique() < 2:
+        raise RuntimeError("Training pool has fewer than two labels after filtering. Lower thresholds or add manual labels.")
+
+    log(f"Training-pool rows: {len(train_pool):,}", indent=1)
+    log(f"Training labels: {train_pool['FINAL_TRAINING_LABEL'].value_counts().to_dict()}", indent=1)
+    return df.reset_index(drop=True), train_pool.reset_index(drop=True), rare_df
+
+
+def select_feature_columns(df: pd.DataFrame, include_rule_flags: bool = False) -> Tuple[List[str], List[str], List[str]]:
+    # Do not include target/evidence/leakage columns. Base counts, distances, default flags, and history metrics stay in.
+    explicit_exclude = {
+        "ECGI", "ECGI_LABEL", "MANUAL_LABEL", "MANUAL_LABEL_NOTES", "SEED_LABEL", "FINAL_TRAINING_LABEL",
+        "LABEL_SOURCE_FOR_MODEL", "SOURCE_FEATURE_EVIDENCE_SUMMARY", "RECOMMENDED_ACTION", "SUPPRESSION_REASON",
+        "ANALYSIS_START_DATE", "ANALYSIS_END_DATE", "FIRST_OBSERVED_DATE", "LAST_OBSERVED_DATE",
+        "SOURCE_FIRST_CHANGE_DATE", "SOURCE_LAST_CHANGE_DATE", "LATEST_SOURCE_CHANGE_DATE",
+        "SOURCE_FIRST_CONFLICT_DATE", "SOURCE_LAST_CONFLICT_DATE", "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE",
+        "LATEST_SOURCE_VALUE_LAST_SEEN_DATE", "LATEST_CANDIDATE_DATE",
+        "FIRST_SOURCE_VALUE", "LATEST_SOURCE_VALUE", "PREVIOUS_NONLATEST_SOURCE_VALUE", "MODE_SOURCE_VALUE",
+        "FIRST_DB_VALUE", "LATEST_DB_VALUE", "PREVIOUS_NONLATEST_DB_VALUE", "LATEST_PREVIOUS_SOURCE_VALUE",
+        "LATEST_CURRENT_SOURCE_VALUE", "SOURCE_LATEST_CHANGE",
+        "REFERENCE_SOURCE_FILE", "REFERENCE_COLUMN", "REFERENCE_VALUE",
+        "REFERENCE_KEY_TYPE", "REFERENCE_KEY_VALUE",
+        "SEED_RULE_SCORE", "SEED_RULE_PERCENTILE", "SEED_LABEL_CONFIDENCE", "TRAINING_WEIGHT",
+        "TRAIN_FOR_MODEL_FLAG", "IS_REPORTABLE_PROBLEM", "IS_SUPPRESSED_NORMAL", "NEEDS_MANUAL_REVIEW",
+    }
+    direct_rule_flags = {
+        "AUDIT_PUSH_NOT_APPLIED_FLAG", "FALLBACK_TO_DEFAULT_VALUE_FLAG", "LATEST_FALLBACK_TO_DEFAULT_VALUE_FLAG", "HISTORICAL_DEFAULT_FALLBACK_EPISODE_FLAG", "REAL_BACK_AND_FORTH_FLAG",
+        "HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", "SOURCE_SAME_DAY_CONFLICT_FLAG", "PERSISTENT_SOURCE_INSTABILITY_FLAG",
+        "NORMAL_STABLE_SOURCE_CHANGE_SUPPRESSOR_FLAG", "BULK_OR_REFRESH_SUPPRESSOR_FLAG",
+        "COORDINATED_MULTI_FIELD_SUPPRESSOR_FLAG", "DB_PUSH_CHECK_CANDIDATE_FLAG", "HAS_PROBLEM_SEED_FLAG",
+        "SOURCE_EXISTS_SERVER_REPORTED_DEFAULT_FLAG", "SOURCE_MISSING_SERVER_REPORTED_DEFAULT_FLAG",
+        "LONG_TERM_DEFAULT_FALLBACK_FLAG", "SHORT_TERM_DEFAULT_FALLBACK_FLAG", "FLUCTUATING_DEFAULT_FALLBACK_FLAG",
+        "SITE_WIDE_LONG_TERM_DEFAULT_FALLBACK_SUSPECT_FLAG",
+    }
+    if not include_rule_flags:
+        explicit_exclude |= direct_rule_flags
+
+    categorical_candidates = [
+        "FEATURE", "REGION", "MARKETCLUSTER", "MARKET", "SUBMARKET", "SERVER_ID",
+        "DATA_SOURCE_COMPATIBILITY", "DATA_SOURCE_MATCH_STATUS", "FALLBACK_DURATION_CLUSTER",
+        "FALLBACK_SOURCE_DATA_CLUSTER", "REFERENCE_SOURCE_NAME",
+    ]
+    categorical_features = [c for c in categorical_candidates if c in df.columns and c not in explicit_exclude]
+    numeric_features: List[str] = []
+    for c in df.columns:
+        if c in explicit_exclude or c in categorical_features:
+            continue
+        if pd.api.types.is_numeric_dtype(df[c]):
+            numeric_features.append(c)
+        else:
+            # If it is object but mostly numeric, include after conversion.
+            maybe = pd.to_numeric(df[c], errors="coerce")
+            if maybe.notna().mean() > 0.90:
+                numeric_features.append(c)
+    model_features = categorical_features + numeric_features
+    if not model_features:
+        raise ValueError("No model features selected. Check dataset columns and exclusion rules.")
+    return model_features, categorical_features, numeric_features
+
+
+def prepare_X(df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = df.copy()
+    for c in features:
+        if c not in X.columns:
+            X[c] = "UNKNOWN" if c in categorical_features else 0
+    X = X[features].copy()
+    for c in categorical_features:
+        X[c] = X[c].fillna("UNKNOWN").astype(str).replace({"": "UNKNOWN", "nan": "UNKNOWN", "None": "UNKNOWN"})
+    for c in X.columns:
+        if c not in categorical_features:
+            X[c] = pd.to_numeric(X[c], errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0)
+    return X
+
+
+def import_torch_or_raise():
+    try:
+        import torch  # noqa: F401
+        return torch
+    except Exception as exc:
+        raise RuntimeError(
+            "PyTorch is required for --model mlp/tabtransformer/fttransformer. "
+            "Install: python -m pip install torch"
+        ) from exc
+
+
+def get_backend(model_choice: str):
+    m = model_choice.lower().strip()
+    if m == "catboost":
+        try:
+            from catboost import CatBoostClassifier  # type: ignore
+            return "catboost", CatBoostClassifier
+        except Exception as exc:
+            raise RuntimeError("CatBoost requested but unavailable. Install: python -m pip install catboost") from exc
+    if m == "lightgbm":
+        try:
+            from lightgbm import LGBMClassifier  # type: ignore
+            return "lightgbm", LGBMClassifier
+        except Exception as exc:
+            raise RuntimeError("LightGBM requested but unavailable. Install: python -m pip install lightgbm") from exc
+    if m == "sklearn_rf":
+        from sklearn.ensemble import RandomForestClassifier
+        return "sklearn_rf", RandomForestClassifier
+    if m in {"mlp", "tabtransformer", "fttransformer"}:
+        import_torch_or_raise()
+        return m, None
+    if m == "tabnet":
+        try:
+            from pytorch_tabnet.tab_model import TabNetClassifier  # type: ignore
+            import_torch_or_raise()
+            return "tabnet", TabNetClassifier
+        except Exception as exc:
+            raise RuntimeError("TabNet requested but unavailable. Install: python -m pip install pytorch-tabnet torch") from exc
+    if m == "auto":
+        try:
+            from catboost import CatBoostClassifier  # type: ignore
+            return "catboost", CatBoostClassifier
+        except Exception:
+            pass
+        try:
+            from lightgbm import LGBMClassifier  # type: ignore
+            return "lightgbm", LGBMClassifier
+        except Exception:
+            pass
+        from sklearn.ensemble import RandomForestClassifier
+        return "sklearn_rf", RandomForestClassifier
+    raise ValueError("--model must be one of: auto, catboost, lightgbm, sklearn_rf, mlp, tabtransformer, fttransformer, tabnet")
+
+def train_test_split_safe(df: pd.DataFrame, label_col: str, test_size: float, random_state: int):
+    from sklearn.model_selection import train_test_split
+    y = df[label_col].astype(str)
+    counts = y.value_counts()
+    stratify = y if counts.min() >= 2 and len(counts) > 1 else None
+    train_df, test_df = train_test_split(df, test_size=test_size, random_state=random_state, stratify=stratify)
+    return train_df.reset_index(drop=True), test_df.reset_index(drop=True)
+
+
+
+class TorchTabularPreprocessor:
+    """Small tabular preprocessor for PyTorch backends."""
+
+    def __init__(self, categorical_features: List[str], numeric_features: List[str]):
+        self.categorical_features = list(categorical_features)
+        self.numeric_features = list(numeric_features)
+        self.vocabs: Dict[str, Dict[str, int]] = {}
+        self.num_median: Dict[str, float] = {}
+        self.num_mean: Dict[str, float] = {}
+        self.num_std: Dict[str, float] = {}
+
+    def fit(self, df: pd.DataFrame):
+        for c in self.categorical_features:
+            vals = df[c].fillna("UNKNOWN").astype(str).replace({"": "UNKNOWN"}) if c in df.columns else pd.Series(["UNKNOWN"])
+            uniq = vals.value_counts(dropna=False).index.astype(str).tolist()
+            vocab = {"__UNK__": 0}
+            for i, v in enumerate(uniq, start=1):
+                vocab[str(v)] = i
+            self.vocabs[c] = vocab
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan) if c in df.columns else pd.Series([0.0])
+            med = float(vals.median()) if vals.notna().any() else 0.0
+            vals2 = vals.fillna(med)
+            mean = float(vals2.mean()) if len(vals2) else 0.0
+            std = float(vals2.std(ddof=0)) if len(vals2) else 1.0
+            if not np.isfinite(std) or std <= 1e-8:
+                std = 1.0
+            self.num_median[c] = med
+            self.num_mean[c] = mean
+            self.num_std[c] = std
+        return self
+
+    def transform(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        cat_arrays = []
+        for c in self.categorical_features:
+            vocab = self.vocabs.get(c, {"__UNK__": 0})
+            vals = df[c].fillna("UNKNOWN").astype(str).replace({"": "UNKNOWN"}) if c in df.columns else pd.Series(["UNKNOWN"] * len(df))
+            cat_arrays.append(vals.map(lambda x: vocab.get(str(x), 0)).astype("int64").values)
+        X_cat = np.vstack(cat_arrays).T.astype("int64") if cat_arrays else np.zeros((len(df), 0), dtype="int64")
+        num_arrays = []
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan) if c in df.columns else pd.Series([0.0] * len(df))
+            vals = vals.fillna(self.num_median.get(c, 0.0))
+            vals = (vals - self.num_mean.get(c, 0.0)) / self.num_std.get(c, 1.0)
+            num_arrays.append(vals.astype("float32").values)
+        X_num = np.vstack(num_arrays).T.astype("float32") if num_arrays else np.zeros((len(df), 0), dtype="float32")
+        return X_cat, X_num
+
+    def vocab_sizes(self) -> List[int]:
+        return [max(self.vocabs.get(c, {"__UNK__": 0}).values()) + 1 for c in self.categorical_features]
+
+
+class TorchTabularClassifier:
+    """PyTorch MLP / TabTransformer-style / FT-Transformer-style classifier."""
+
+    def __init__(
+        self,
+        model_type: str,
+        categorical_features: List[str],
+        numeric_features: List[str],
+        random_state: int = 42,
+        epochs: int = 120,
+        batch_size: int = 512,
+        learning_rate: float = 1e-3,
+        train_verbose: int = 25,
+        early_stopping_rounds: int = 25,
+        device: str = "auto",
+    ):
+        self.model_type = model_type.lower().strip()
+        self.categorical_features = list(categorical_features)
+        self.numeric_features = list(numeric_features)
+        self.random_state = int(random_state)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.learning_rate = float(learning_rate)
+        self.train_verbose = int(train_verbose)
+        self.early_stopping_rounds = int(early_stopping_rounds)
+        self.device_requested = device
+        self.classes_: np.ndarray = np.array([])
+        self.class_to_idx_: Dict[str, int] = {}
+        self.preprocessor: Optional[TorchTabularPreprocessor] = None
+        self.model = None
+        self.history_: Dict[str, Dict[str, List[float]]] = {"learn": {"loss": [], "accuracy": []}, "validation": {"loss": [], "accuracy": []}}
+
+    def _device(self):
+        torch = import_torch_or_raise()
+        if self.device_requested == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return torch.device(self.device_requested)
+
+    def _build_model(self, vocab_sizes: List[int], n_num: int, n_classes: int):
+        torch = import_torch_or_raise()
+        nn = torch.nn
+        d_model = 64
+
+        if self.model_type == "mlp":
+            class _MLP(nn.Module):
+                def __init__(self, vocab_sizes, n_num, n_classes):
+                    super().__init__()
+                    self.embs = nn.ModuleList()
+                    emb_total = 0
+                    for vs in vocab_sizes:
+                        dim = min(16, max(2, int(round(math.sqrt(max(vs, 2)))) + 1))
+                        self.embs.append(nn.Embedding(vs, dim))
+                        emb_total += dim
+                    in_dim = emb_total + n_num
+                    self.net = nn.Sequential(
+                        nn.Linear(max(in_dim, 1), 256), nn.ReLU(), nn.BatchNorm1d(256), nn.Dropout(0.20),
+                        nn.Linear(256, 128), nn.ReLU(), nn.BatchNorm1d(128), nn.Dropout(0.15),
+                        nn.Linear(128, n_classes),
+                    )
+                def forward(self, x_cat, x_num):
+                    parts = [emb(x_cat[:, i]) for i, emb in enumerate(self.embs)]
+                    if x_num.shape[1] > 0:
+                        parts.append(x_num)
+                    x = torch.cat(parts, dim=1) if parts else torch.zeros((x_cat.shape[0], 1), device=x_cat.device)
+                    return self.net(x)
+            return _MLP(vocab_sizes, n_num, n_classes)
+
+        if self.model_type == "tabtransformer":
+            class _TabTransformer(nn.Module):
+                def __init__(self, vocab_sizes, n_num, n_classes):
+                    super().__init__()
+                    self.embs = nn.ModuleList([nn.Embedding(vs, d_model) for vs in vocab_sizes])
+                    enc = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=128, dropout=0.10, batch_first=True)
+                    self.encoder = nn.TransformerEncoder(enc, num_layers=2)
+                    self.num_net = nn.Sequential(nn.Linear(max(n_num, 1), 64), nn.ReLU(), nn.Dropout(0.10))
+                    in_dim = (d_model if len(vocab_sizes) > 0 else 0) + 64
+                    self.head = nn.Sequential(nn.Linear(max(in_dim, 1), 128), nn.ReLU(), nn.Dropout(0.15), nn.Linear(128, n_classes))
+                def forward(self, x_cat, x_num):
+                    parts = []
+                    if len(self.embs) > 0:
+                        toks = [emb(x_cat[:, i]).unsqueeze(1) for i, emb in enumerate(self.embs)]
+                        z = self.encoder(torch.cat(toks, dim=1)).mean(dim=1)
+                        parts.append(z)
+                    if x_num.shape[1] > 0:
+                        parts.append(self.num_net(x_num))
+                    else:
+                        parts.append(self.num_net(torch.zeros((x_cat.shape[0], 1), device=x_cat.device)))
+                    return self.head(torch.cat(parts, dim=1) if len(parts) > 1 else parts[0])
+            return _TabTransformer(vocab_sizes, n_num, n_classes)
+
+        if self.model_type == "fttransformer":
+            class _FTTransformer(nn.Module):
+                def __init__(self, vocab_sizes, n_num, n_classes):
+                    super().__init__()
+                    self.cat_embs = nn.ModuleList([nn.Embedding(vs, d_model) for vs in vocab_sizes])
+                    self.num_linears = nn.ModuleList([nn.Linear(1, d_model) for _ in range(n_num)])
+                    self.cls = nn.Parameter(torch.zeros(1, 1, d_model))
+                    enc = nn.TransformerEncoderLayer(d_model=d_model, nhead=4, dim_feedforward=128, dropout=0.10, batch_first=True)
+                    self.encoder = nn.TransformerEncoder(enc, num_layers=2)
+                    self.head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, 128), nn.ReLU(), nn.Dropout(0.10), nn.Linear(128, n_classes))
+                def forward(self, x_cat, x_num):
+                    toks = [self.cls.repeat(x_cat.shape[0], 1, 1)]
+                    toks += [emb(x_cat[:, i]).unsqueeze(1) for i, emb in enumerate(self.cat_embs)]
+                    toks += [lin(x_num[:, i:i+1]).unsqueeze(1) for i, lin in enumerate(self.num_linears)]
+                    z = self.encoder(torch.cat(toks, dim=1))
+                    return self.head(z[:, 0, :])
+            return _FTTransformer(vocab_sizes, n_num, n_classes)
+
+        raise ValueError(f"Unsupported torch model_type: {self.model_type}")
+
+    def fit(self, train_df: pd.DataFrame, valid_df: Optional[pd.DataFrame], label_col: str, sample_weight: Optional[np.ndarray] = None):
+        torch = import_torch_or_raise()
+        from torch.utils.data import DataLoader, TensorDataset
+        from sklearn.utils.class_weight import compute_class_weight
+
+        torch.manual_seed(self.random_state)
+        np.random.seed(self.random_state)
+        self.preprocessor = TorchTabularPreprocessor(self.categorical_features, self.numeric_features).fit(train_df)
+        y_train_str = train_df[label_col].astype(str).values
+        self.classes_ = np.array(sorted(pd.Series(y_train_str).unique().tolist()))
+        self.class_to_idx_ = {c: i for i, c in enumerate(self.classes_)}
+        y_train = np.array([self.class_to_idx_[x] for x in y_train_str], dtype="int64")
+        Xc_train, Xn_train = self.preprocessor.transform(train_df)
+
+        has_valid = valid_df is not None and len(valid_df) > 0
+        if has_valid:
+            y_valid_str = valid_df[label_col].astype(str).values
+            y_valid = np.array([self.class_to_idx_.get(x, 0) for x in y_valid_str], dtype="int64")
+            Xc_valid, Xn_valid = self.preprocessor.transform(valid_df)
+        else:
+            y_valid = np.array([], dtype="int64")
+            Xc_valid = np.zeros((0, len(self.categorical_features)), dtype="int64")
+            Xn_valid = np.zeros((0, len(self.numeric_features)), dtype="float32")
+
+        device = self._device()
+        log(f"PyTorch backend={self.model_type}; device={device}; classes={len(self.classes_)}", indent=2)
+        self.model = self._build_model(self.preprocessor.vocab_sizes(), len(self.numeric_features), len(self.classes_)).to(device)
+
+        if sample_weight is None:
+            sample_weight = np.ones(len(train_df), dtype="float32")
+        sample_weight = np.asarray(sample_weight, dtype="float32")
+        try:
+            cw = compute_class_weight(class_weight="balanced", classes=np.arange(len(self.classes_)), y=y_train)
+        except Exception:
+            cw = np.ones(len(self.classes_), dtype="float32")
+        class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
+
+        train_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(Xc_train, dtype=torch.long),
+                torch.tensor(Xn_train, dtype=torch.float32),
+                torch.tensor(y_train, dtype=torch.long),
+                torch.tensor(sample_weight, dtype=torch.float32),
+            ),
+            batch_size=self.batch_size,
+            shuffle=True,
+        )
+        opt = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+        loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights, reduction="none")
+        best_loss = float("inf")
+        best_state = None
+        bad_epochs = 0
+
+        def evaluate_arrays(Xc, Xn, y):
+            if len(y) == 0:
+                return np.nan, np.nan
+            self.model.eval()
+            with torch.no_grad():
+                xc = torch.tensor(Xc, dtype=torch.long, device=device)
+                xn = torch.tensor(Xn, dtype=torch.float32, device=device)
+                yy = torch.tensor(y, dtype=torch.long, device=device)
+                logits = self.model(xc, xn)
+                loss = float(torch.nn.functional.cross_entropy(logits, yy, weight=class_weights).detach().cpu().item())
+                acc = float((logits.argmax(dim=1) == yy).float().mean().detach().cpu().item())
+            return loss, acc
+
+        for epoch in range(1, self.epochs + 1):
+            self.model.train()
+            total_loss = 0.0
+            total_n = 0
+            correct = 0
+            for xb_cat, xb_num, yb, swb in train_loader:
+                xb_cat = xb_cat.to(device)
+                xb_num = xb_num.to(device)
+                yb = yb.to(device)
+                swb = swb.to(device)
+                opt.zero_grad()
+                logits = self.model(xb_cat, xb_num)
+                per_row = loss_fn(logits, yb)
+                loss = (per_row * swb).mean()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 2.0)
+                opt.step()
+                total_loss += float(loss.detach().cpu().item()) * len(yb)
+                total_n += len(yb)
+                correct += int((logits.argmax(dim=1) == yb).sum().detach().cpu().item())
+            train_loss = total_loss / max(total_n, 1)
+            train_acc = correct / max(total_n, 1)
+            valid_loss, valid_acc = evaluate_arrays(Xc_valid, Xn_valid, y_valid) if has_valid else (np.nan, np.nan)
+            self.history_["learn"]["loss"].append(float(train_loss))
+            self.history_["learn"]["accuracy"].append(float(train_acc))
+            self.history_["validation"]["loss"].append(float(valid_loss) if pd.notna(valid_loss) else np.nan)
+            self.history_["validation"]["accuracy"].append(float(valid_acc) if pd.notna(valid_acc) else np.nan)
+            if self.train_verbose and epoch % self.train_verbose == 0:
+                log(f"{self.model_type} epoch={epoch} train_loss={train_loss:.5f} train_acc={train_acc:.4f} valid_loss={valid_loss:.5f} valid_acc={valid_acc:.4f}", indent=2)
+            monitor = valid_loss if has_valid and pd.notna(valid_loss) else train_loss
+            if monitor < best_loss - 1e-5:
+                best_loss = monitor
+                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                bad_epochs = 0
+            else:
+                bad_epochs += 1
+            if bad_epochs >= self.early_stopping_rounds:
+                log(f"{self.model_type} early stopping at epoch {epoch}; best_loss={best_loss:.5f}", indent=2)
+                break
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+            self.model.to(device)
+        return self
+
+    def predict_proba(self, X_df: pd.DataFrame) -> np.ndarray:
+        torch = import_torch_or_raise()
+        if self.model is None or self.preprocessor is None:
+            raise RuntimeError("Torch model is not fitted.")
+        device = self._device()
+        Xc, Xn = self.preprocessor.transform(X_df)
+        probs = []
+        self.model.eval()
+        with torch.no_grad():
+            for start in range(0, len(X_df), self.batch_size):
+                end = start + self.batch_size
+                xb_cat = torch.tensor(Xc[start:end], dtype=torch.long, device=device)
+                xb_num = torch.tensor(Xn[start:end], dtype=torch.float32, device=device)
+                p = torch.softmax(self.model(xb_cat, xb_num), dim=1).detach().cpu().numpy()
+                probs.append(p)
+        return np.vstack(probs) if probs else np.zeros((0, len(self.classes_)))
+
+    def predict(self, X_df: pd.DataFrame) -> np.ndarray:
+        proba = self.predict_proba(X_df)
+        idx = np.argmax(proba, axis=1)
+        return self.classes_[idx]
+
+    def get_evals_result(self):
+        return self.history_
+
+
+class TabNetWrapper:
+    def __init__(self, TabNetClassifierClass, categorical_features: List[str], numeric_features: List[str], random_state: int, epochs: int, batch_size: int, learning_rate: float, patience: int, train_verbose: int):
+        self.TabNetClassifierClass = TabNetClassifierClass
+        self.categorical_features = list(categorical_features)
+        self.numeric_features = list(numeric_features)
+        self.random_state = int(random_state)
+        self.epochs = int(epochs)
+        self.batch_size = int(batch_size)
+        self.learning_rate = float(learning_rate)
+        self.patience = int(patience)
+        self.train_verbose = int(train_verbose)
+        self.cat_encoder = None
+        self.num_medians: Dict[str, float] = {}
+        self.num_means: Dict[str, float] = {}
+        self.num_stds: Dict[str, float] = {}
+        self.label_encoder = None
+        self.model = None
+        self.classes_: np.ndarray = np.array([])
+        self.history_: Dict[str, Dict[str, List[float]]] = {}
+
+    def _fit_transform_X(self, df: pd.DataFrame):
+        from sklearn.preprocessing import OrdinalEncoder, LabelEncoder
+        X_cat_parts = []
+        if self.categorical_features:
+            self.cat_encoder = OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)
+            cat = df[self.categorical_features].fillna("UNKNOWN").astype(str)
+            X_cat = self.cat_encoder.fit_transform(cat).astype("int64") + 1
+            X_cat_parts.append(X_cat)
+        X_num_parts = []
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            med = float(vals.median()) if vals.notna().any() else 0.0
+            vals = vals.fillna(med)
+            mean = float(vals.mean()) if len(vals) else 0.0
+            std = float(vals.std(ddof=0)) if len(vals) else 1.0
+            if not np.isfinite(std) or std <= 1e-8:
+                std = 1.0
+            self.num_medians[c] = med
+            self.num_means[c] = mean
+            self.num_stds[c] = std
+            X_num_parts.append(((vals - mean) / std).astype("float32").values.reshape(-1, 1))
+        parts = []
+        if X_cat_parts:
+            parts.append(X_cat_parts[0].astype("float32"))
+        if X_num_parts:
+            parts.append(np.hstack(X_num_parts).astype("float32"))
+        if not parts:
+            return np.zeros((len(df), 1), dtype="float32")
+        return np.hstack(parts).astype("float32")
+
+    def _transform_X(self, df: pd.DataFrame):
+        parts = []
+        if self.categorical_features:
+            cat = df[self.categorical_features].fillna("UNKNOWN").astype(str)
+            X_cat = self.cat_encoder.transform(cat).astype("int64") + 1
+            X_cat[X_cat < 0] = 0
+            parts.append(X_cat.astype("float32"))
+        num_parts = []
+        for c in self.numeric_features:
+            vals = pd.to_numeric(df[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
+            vals = vals.fillna(self.num_medians.get(c, 0.0))
+            vals = (vals - self.num_means.get(c, 0.0)) / self.num_stds.get(c, 1.0)
+            num_parts.append(vals.astype("float32").values.reshape(-1, 1))
+        if num_parts:
+            parts.append(np.hstack(num_parts).astype("float32"))
+        if not parts:
+            return np.zeros((len(df), 1), dtype="float32")
+        return np.hstack(parts).astype("float32")
+
+    def fit(self, train_df: pd.DataFrame, valid_df: Optional[pd.DataFrame], label_col: str, sample_weight: Optional[np.ndarray] = None):
+        import torch
+        from sklearn.preprocessing import LabelEncoder
+        self.label_encoder = LabelEncoder()
+        y_train = self.label_encoder.fit_transform(train_df[label_col].astype(str).values)
+        self.classes_ = self.label_encoder.classes_
+        X_train = self._fit_transform_X(train_df)
+        eval_set = None
+        eval_name = None
+        if valid_df is not None and len(valid_df) > 0:
+            X_valid = self._transform_X(valid_df)
+            y_valid = self.label_encoder.transform(valid_df[label_col].astype(str).values)
+            eval_set = [(X_valid, y_valid)]
+            eval_name = ["validation"]
+        cat_idxs = list(range(len(self.categorical_features)))
+        cat_dims = []
+        if self.categorical_features and self.cat_encoder is not None:
+            for cats in self.cat_encoder.categories_:
+                cat_dims.append(len(cats) + 2)
+        self.model = self.TabNetClassifierClass(
+            cat_idxs=cat_idxs,
+            cat_dims=cat_dims,
+            cat_emb_dim=8,
+            optimizer_fn=torch.optim.Adam,
+            optimizer_params=dict(lr=self.learning_rate),
+            seed=self.random_state,
+            verbose=max(1, self.train_verbose) if self.train_verbose else 0,
+        )
+        self.model.fit(
+            X_train=X_train,
+            y_train=y_train,
+            eval_set=eval_set,
+            eval_name=eval_name,
+            max_epochs=self.epochs,
+            patience=self.patience,
+            batch_size=self.batch_size,
+            virtual_batch_size=min(128, self.batch_size),
+            weights=sample_weight,
+        )
+        try:
+            hist = getattr(self.model, "history", {})
+            self.history_ = hist if isinstance(hist, dict) else {}
+        except Exception:
+            self.history_ = {}
+        return self
+
+    def predict_proba(self, X_df: pd.DataFrame) -> np.ndarray:
+        X = self._transform_X(X_df)
+        return self.model.predict_proba(X)
+
+    def predict(self, X_df: pd.DataFrame) -> np.ndarray:
+        idx = np.argmax(self.predict_proba(X_df), axis=1)
+        return self.classes_[idx]
+
+    def get_evals_result(self):
+        return self.history_
+
+
+def fit_model(train_df: pd.DataFrame, valid_df: Optional[pd.DataFrame], label_col: str, features: List[str], categorical_features: List[str], backend: str, ModelClass, args: argparse.Namespace):
+    X_train = prepare_X(train_df, features, categorical_features)
+    y_train = train_df[label_col].astype(str)
+    sample_weight = safe_numeric(train_df.get("TRAINING_WEIGHT", pd.Series(np.ones(len(train_df)))), 1.0).values
+
+    if valid_df is not None and len(valid_df) > 0:
+        X_valid = prepare_X(valid_df, features, categorical_features)
+        y_valid = valid_df[label_col].astype(str)
+    else:
+        X_valid = None
+        y_valid = None
+
+    if backend == "catboost":
+        cat_idx = [X_train.columns.get_loc(c) for c in categorical_features if c in X_train.columns]
+        model = ModelClass(
+            iterations=args.iterations,
+            depth=args.depth,
+            learning_rate=args.learning_rate,
+            loss_function="MultiClass",
+            eval_metric="TotalF1",
+            random_seed=args.random_state,
+            verbose=False,
+            allow_writing_files=False,
+            auto_class_weights="Balanced",
+            od_type="Iter",
+            od_wait=args.early_stopping_rounds,
+        )
+        fit_kwargs = {"cat_features": cat_idx, "sample_weight": sample_weight, "verbose": args.train_verbose if args.train_verbose > 0 else False}
+        if X_valid is not None:
+            fit_kwargs["eval_set"] = (X_valid, y_valid)
+            fit_kwargs["use_best_model"] = True
+        model.fit(X_train, y_train, **fit_kwargs)
+        return model
+
+    if backend == "lightgbm":
+        import lightgbm as lgb
+        X_train_lgb = X_train.copy()
+        for c in categorical_features:
+            if c in X_train_lgb.columns:
+                X_train_lgb[c] = X_train_lgb[c].astype("category")
+        eval_set = [(X_train_lgb, y_train)]
+        eval_names = ["train"]
+        if X_valid is not None:
+            X_valid_lgb = X_valid.copy()
+            for c in categorical_features:
+                if c in X_valid_lgb.columns:
+                    X_valid_lgb[c] = X_valid_lgb[c].astype("category")
+            eval_set.append((X_valid_lgb, y_valid))
+            eval_names.append("validation")
+        model = ModelClass(
+            n_estimators=args.iterations,
+            learning_rate=args.learning_rate,
+            max_depth=-1,
+            num_leaves=args.num_leaves,
+            objective="multiclass",
+            class_weight="balanced",
+            random_state=args.random_state,
+            n_jobs=-1,
+        )
+        callbacks = []
+        if args.train_verbose > 0:
+            callbacks.append(lgb.log_evaluation(period=args.train_verbose))
+        if X_valid is not None:
+            callbacks.append(lgb.early_stopping(stopping_rounds=args.early_stopping_rounds))
+        model.fit(
+            X_train_lgb,
+            y_train,
+            sample_weight=sample_weight,
+            eval_set=eval_set,
+            eval_names=eval_names,
+            eval_metric="multi_logloss",
+            callbacks=callbacks,
+        )
+        return model
+
+    if backend == "sklearn_rf":
+        from sklearn.compose import ColumnTransformer
+        from sklearn.ensemble import RandomForestClassifier
+        from sklearn.impute import SimpleImputer
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder
+        numeric_features = [c for c in features if c not in categorical_features]
+        pre = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore", min_frequency=args.onehot_min_frequency), categorical_features),
+                ("num", SimpleImputer(strategy="median"), numeric_features),
+            ],
+            remainder="drop",
+            sparse_threshold=0.3,
+        )
+        clf = RandomForestClassifier(
+            n_estimators=args.rf_estimators,
+            max_depth=args.rf_max_depth if args.rf_max_depth > 0 else None,
+            min_samples_leaf=args.rf_min_samples_leaf,
+            class_weight="balanced_subsample",
+            random_state=args.random_state,
+            n_jobs=-1,
+        )
+        pipe = Pipeline([("preprocess", pre), ("model", clf)])
+        pipe.fit(X_train, y_train, model__sample_weight=sample_weight)
+        return pipe
+
+    if backend in {"mlp", "tabtransformer", "fttransformer"}:
+        numeric_features = [c for c in features if c not in categorical_features]
+        model = TorchTabularClassifier(
+            model_type=backend,
+            categorical_features=categorical_features,
+            numeric_features=numeric_features,
+            random_state=args.random_state,
+            epochs=args.torch_epochs,
+            batch_size=args.torch_batch_size,
+            learning_rate=args.torch_lr,
+            train_verbose=args.train_verbose,
+            early_stopping_rounds=max(10, min(args.early_stopping_rounds, 50)),
+            device=args.torch_device,
+        )
+        train_torch = X_train.copy()
+        train_torch[label_col] = y_train.values
+        valid_torch = None
+        if X_valid is not None:
+            valid_torch = X_valid.copy()
+            valid_torch[label_col] = y_valid.values
+        model.fit(train_df=train_torch, valid_df=valid_torch, label_col=label_col, sample_weight=sample_weight)
+        return model
+
+    if backend == "tabnet":
+        numeric_features = [c for c in features if c not in categorical_features]
+        model = TabNetWrapper(
+            TabNetClassifierClass=ModelClass,
+            categorical_features=categorical_features,
+            numeric_features=numeric_features,
+            random_state=args.random_state,
+            epochs=args.tabnet_epochs,
+            batch_size=args.tabnet_batch_size,
+            learning_rate=args.tabnet_lr,
+            patience=args.early_stopping_rounds,
+            train_verbose=args.train_verbose,
+        )
+        model.fit(train_df=X_train.assign(**{label_col: y_train.values}), valid_df=(X_valid.assign(**{label_col: y_valid.values}) if X_valid is not None else None), label_col=label_col, sample_weight=sample_weight)
+        return model
+
+    raise ValueError(f"Unsupported backend: {backend}")
+
+
+def predict_model(model, backend: str, df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = prepare_X(df, features, categorical_features)
+    if backend == "lightgbm":
+        for c in categorical_features:
+            if c in X.columns:
+                X[c] = X[c].astype("category")
+    pred = model.predict(X)
+    pred = np.asarray(pred).reshape(-1).astype(str)
+    out = pd.DataFrame({"MODEL_PREDICTED_LABEL": pred})
+    if hasattr(model, "predict_proba"):
+        proba = model.predict_proba(X)
+        classes = list(model.classes_) if hasattr(model, "classes_") else [f"CLASS_{i}" for i in range(proba.shape[1])]
+        for i, cls in enumerate(classes):
+            out[f"PRED_PROBA_{sanitize_label(cls)}"] = proba[:, i]
+        out["MODEL_CONFIDENCE"] = np.max(proba, axis=1)
+    else:
+        out["MODEL_CONFIDENCE"] = np.nan
+    return out
+
+
+def _prediction_probability_matrix(pred_df: pd.DataFrame) -> Tuple[List[str], Optional[np.ndarray]]:
+    proba_cols = [c for c in pred_df.columns if c.startswith("PRED_PROBA_")]
+    if not proba_cols:
+        return [], None
+    classes = [c.replace("PRED_PROBA_", "") for c in proba_cols]
+    proba = pred_df[proba_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).values
+    return classes, proba
+
+
+def evaluate_predictions(y_true: pd.Series, pred_df: pd.DataFrame, out_dir: Path, prefix: str) -> Dict[str, object]:
+    from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, log_loss, top_k_accuracy_score
+    y_true = y_true.astype(str).map(sanitize_label)
+    y_pred = pred_df["MODEL_PREDICTED_LABEL"].astype(str).map(sanitize_label)
+    labels = sorted(set(y_true.unique()).union(set(y_pred.unique())))
+    report = classification_report(y_true, y_pred, output_dict=True, zero_division=0)
+    pd.DataFrame(report).T.to_csv(out_dir / f"{prefix}_classification_report.csv")
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    pd.DataFrame(cm, index=[f"TRUE_{x}" for x in labels], columns=[f"PRED_{x}" for x in labels]).to_csv(out_dir / f"{prefix}_confusion_matrix.csv")
+    metrics: Dict[str, object] = {
+        "rows": int(len(y_true)),
+        "classes": int(len(labels)),
+        "accuracy": float(accuracy_score(y_true, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, y_pred)),
+        "macro_f1": float(f1_score(y_true, y_pred, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+    }
+    classes, proba = _prediction_probability_matrix(pred_df)
+    if proba is not None and len(classes) >= 2:
+        y_for_proba = y_true.map(sanitize_label)
+        # Align to probability columns. Missing labels in probability output are skipped for log-loss/top-k.
+        valid_mask = y_for_proba.isin(classes)
+        if valid_mask.any():
+            try:
+                metrics["multiclass_log_loss"] = float(log_loss(y_for_proba[valid_mask], proba[valid_mask.values], labels=classes))
+            except Exception:
+                metrics["multiclass_log_loss"] = np.nan
+            for k in [2, 3, 5]:
+                if len(classes) >= k:
+                    try:
+                        metrics[f"top_{k}_accuracy"] = float(top_k_accuracy_score(y_for_proba[valid_mask], proba[valid_mask.values], k=k, labels=classes))
+                    except Exception:
+                        metrics[f"top_{k}_accuracy"] = np.nan
+    pd.DataFrame([metrics]).to_csv(out_dir / f"{prefix}_test_metric_summary.csv", index=False)
+    return metrics
+
+def get_feature_importance(model, backend: str, features: List[str]) -> pd.DataFrame:
+    if backend == "catboost":
+        try:
+            imp = model.get_feature_importance()
+            return pd.DataFrame({"FEATURE": features, "IMPORTANCE": imp}).sort_values("IMPORTANCE", ascending=False)
+        except Exception:
+            pass
+    if backend == "lightgbm" and hasattr(model, "feature_importances_"):
+        return pd.DataFrame({"FEATURE": features, "IMPORTANCE": model.feature_importances_}).sort_values("IMPORTANCE", ascending=False)
+    if backend == "sklearn_rf":
+        try:
+            clf = model.named_steps["model"]
+            pre = model.named_steps["preprocess"]
+            names = []
+            try:
+                names = list(pre.get_feature_names_out())
+            except Exception:
+                names = [f"FEATURE_{i}" for i in range(len(clf.feature_importances_))]
+            return pd.DataFrame({"FEATURE": names, "IMPORTANCE": clf.feature_importances_}).sort_values("IMPORTANCE", ascending=False)
+        except Exception:
+            pass
+    return pd.DataFrame({"FEATURE": features, "IMPORTANCE": np.nan})
+
+
+def add_score_columns(scored: pd.DataFrame) -> pd.DataFrame:
+    out = scored.copy()
+    proba_cols = [c for c in out.columns if c.startswith("PRED_PROBA_")]
+    problem_cols = [f"PRED_PROBA_{sanitize_label(lbl)}" for lbl in PROBLEM_LABELS if f"PRED_PROBA_{sanitize_label(lbl)}" in out.columns]
+    suppress_cols = [f"PRED_PROBA_{sanitize_label(lbl)}" for lbl in SUPPRESSOR_LABELS if f"PRED_PROBA_{sanitize_label(lbl)}" in out.columns]
+    if problem_cols:
+        out["ML_PROBLEM_PROBABILITY"] = out[problem_cols].sum(axis=1).clip(0, 1)
+    else:
+        out["ML_PROBLEM_PROBABILITY"] = np.where(out["MODEL_PREDICTED_LABEL"].isin(PROBLEM_LABELS), out["MODEL_CONFIDENCE"], 0)
+    if suppress_cols:
+        out["ML_SUPPRESSOR_PROBABILITY"] = out[suppress_cols].sum(axis=1).clip(0, 1)
+    else:
+        out["ML_SUPPRESSOR_PROBABILITY"] = np.where(out["MODEL_PREDICTED_LABEL"].isin(SUPPRESSOR_LABELS), out["MODEL_CONFIDENCE"], 0)
+    if "SEED_RULE_PERCENTILE" not in out.columns:
+        out["SEED_RULE_PERCENTILE"] = percentile_rank(out.get("SEED_RULE_SCORE", pd.Series(np.zeros(len(out)))))
+    if "FEATURE_CRITICALITY_WEIGHT" in out.columns:
+        out["FEATURE_CRITICALITY_PERCENTILE"] = percentile_rank(out["FEATURE_CRITICALITY_WEIGHT"])
+    else:
+        out["FEATURE_CRITICALITY_PERCENTILE"] = 50.0
+    out["ML_FINAL_PROBLEM_SCORE"] = (
+        0.80 * 100.0 * out["ML_PROBLEM_PROBABILITY"].fillna(0)
+        + 0.15 * out["SEED_RULE_PERCENTILE"].fillna(0)
+        + 0.05 * out["FEATURE_CRITICALITY_PERCENTILE"].fillna(0)
+        - 0.20 * 100.0 * out["ML_SUPPRESSOR_PROBABILITY"].fillna(0)
+    ).clip(lower=0)
+    out["ML_FINAL_PROBLEM_PERCENTILE"] = percentile_rank(out["ML_FINAL_PROBLEM_SCORE"])
+    out["MODEL_RECOMMENDED_BUCKET"] = np.select(
+        [
+            out["ML_PROBLEM_PROBABILITY"] >= 0.80,
+            out["ML_PROBLEM_PROBABILITY"] >= 0.60,
+            out["ML_SUPPRESSOR_PROBABILITY"] >= 0.70,
+        ],
+        ["HIGH_CONFIDENCE_PROBLEM", "MEDIUM_CONFIDENCE_PROBLEM", "LIKELY_SUPPRESSED_NORMAL"],
+        default="NEEDS_REVIEW_OR_LOW_CONFIDENCE",
+    )
+    return out
+
+
+def extract_training_history(model, backend: str) -> Dict[str, Dict[str, List[float]]]:
+    if backend == "catboost":
+        try:
+            return model.get_evals_result()
+        except Exception:
+            return {}
+    if backend == "lightgbm":
+        try:
+            return model.evals_result_
+        except Exception:
+            return {}
+    if backend in {"mlp", "tabtransformer", "fttransformer", "tabnet"}:
+        try:
+            hist = model.get_evals_result()
+            return hist if isinstance(hist, dict) else {}
+        except Exception:
+            return getattr(model, "history_", {}) or {}
+    return {}
+
+
+def _append_plot(plot_rows: List[Dict[str, str]], path: Path, description: str) -> None:
+    plot_rows.append({"PLOT_FILE": str(path), "DESCRIPTION": description})
+
+
+def _get_proba_columns(pred_df: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    cols = [c for c in pred_df.columns if c.startswith("PRED_PROBA_")]
+    labels = [c.replace("PRED_PROBA_", "") for c in cols]
+    return labels, cols
+
+
+def create_diagnostic_plots(
+    out_dir: Path,
+    model,
+    backend: str,
+    test_df: pd.DataFrame,
+    test_pred: pd.DataFrame,
+    scored: pd.DataFrame,
+    feature_importance: pd.DataFrame,
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    if getattr(args, "no_plots", False):
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": "plots skipped by --no-plots"}])
+    try:
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import auc, precision_recall_curve, roc_curve, average_precision_score, roc_auc_score, confusion_matrix
+    except Exception as exc:
+        log(f"Plotting unavailable: {exc}", indent=1)
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": f"plotting unavailable: {exc}"}])
+
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    plot_rows: List[Dict[str, str]] = []
+
+    # 1) Training convergence curves.
+    history = extract_training_history(model, backend)
+    hist_rows = []
+    if history:
+        for dataset_name, metric_map in history.items():
+            if not isinstance(metric_map, dict):
+                continue
+            for metric_name, values in metric_map.items():
+                if values is None:
+                    continue
+                try:
+                    vals = list(values)
+                except Exception:
+                    continue
+                for i, v in enumerate(vals, start=1):
+                    try:
+                        vv = float(v)
+                    except Exception:
+                        vv = np.nan
+                    hist_rows.append({"DATASET": str(dataset_name), "METRIC": str(metric_name), "ITERATION": i, "VALUE": vv})
+    hist_df = pd.DataFrame(hist_rows)
+    if not hist_df.empty:
+        hist_df.to_csv(out_dir / "cesmlc_v6_ml_training_history.csv", index=False)
+        for metric in hist_df["METRIC"].dropna().unique():
+            part = hist_df[hist_df["METRIC"] == metric]
+            fig = plt.figure(figsize=(10, 6))
+            ax = fig.add_subplot(111)
+            for ds in part["DATASET"].dropna().unique():
+                d = part[part["DATASET"] == ds].sort_values("ITERATION")
+                ax.plot(d["ITERATION"], d["VALUE"], label=str(ds))
+            ax.set_title(f"Training convergence - {metric}")
+            ax.set_xlabel("Iteration / epoch")
+            ax.set_ylabel(str(metric))
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            safe_metric = re.sub(r"[^A-Za-z0-9]+", "_", str(metric)).strip("_")
+            fp = plots_dir / f"01_training_convergence_{safe_metric}.png"
+            plt.savefig(fp, dpi=160)
+            plt.close(fig)
+            _append_plot(plot_rows, fp, f"Training/validation convergence curve for {metric}")
+    else:
+        pd.DataFrame([{"NOTE": f"No convergence history available for backend={backend}"}]).to_csv(out_dir / "cesmlc_v6_ml_training_history.csv", index=False)
+
+    # 2) Confusion matrix, raw and normalized.
+    y_true = test_df["FINAL_TRAINING_LABEL"].astype(str).map(sanitize_label)
+    y_pred = test_pred["MODEL_PREDICTED_LABEL"].astype(str).map(sanitize_label)
+    labels = sorted(set(y_true.unique()).union(set(y_pred.unique())))
+    if labels:
+        cm = confusion_matrix(y_true, y_pred, labels=labels)
+        fig_size = max(8, min(22, 0.65 * len(labels) + 5))
+        fig = plt.figure(figsize=(fig_size, fig_size))
+        ax = fig.add_subplot(111)
+        im = ax.imshow(cm)
+        ax.set_title("V6 multiclass confusion matrix - counts")
+        ax.set_xticks(np.arange(len(labels)))
+        ax.set_yticks(np.arange(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        if len(labels) <= 15:
+            for i in range(len(labels)):
+                for j in range(len(labels)):
+                    ax.text(j, i, str(cm[i, j]), ha="center", va="center", fontsize=7)
+        fig.colorbar(im, ax=ax)
+        plt.tight_layout()
+        fp = plots_dir / "02_confusion_matrix_counts.png"
+        plt.savefig(fp, dpi=160)
+        plt.close(fig)
+        _append_plot(plot_rows, fp, "Multiclass confusion matrix with counts")
+
+        cm_norm = cm.astype(float) / np.maximum(cm.sum(axis=1, keepdims=True), 1)
+        fig = plt.figure(figsize=(fig_size, fig_size))
+        ax = fig.add_subplot(111)
+        im = ax.imshow(cm_norm, vmin=0, vmax=1)
+        ax.set_title("V6 multiclass confusion matrix - row normalized")
+        ax.set_xticks(np.arange(len(labels)))
+        ax.set_yticks(np.arange(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8)
+        ax.set_yticklabels(labels, fontsize=8)
+        ax.set_xlabel("Predicted")
+        ax.set_ylabel("Actual")
+        fig.colorbar(im, ax=ax)
+        plt.tight_layout()
+        fp = plots_dir / "03_confusion_matrix_normalized.png"
+        plt.savefig(fp, dpi=160)
+        plt.close(fig)
+        _append_plot(plot_rows, fp, "Row-normalized multiclass confusion matrix")
+
+    # 3) True vs predicted label distributions.
+    true_counts = y_true.value_counts().rename_axis("LABEL").reset_index(name="TRUE_COUNT")
+    pred_counts = y_pred.value_counts().rename_axis("LABEL").reset_index(name="PRED_COUNT")
+    dist = true_counts.merge(pred_counts, on="LABEL", how="outer").fillna(0)
+    if not dist.empty:
+        dist = dist.sort_values("TRUE_COUNT", ascending=False).head(25)
+        fig = plt.figure(figsize=(12, 6))
+        ax = fig.add_subplot(111)
+        x = np.arange(len(dist))
+        width = 0.4
+        ax.bar(x - width / 2, dist["TRUE_COUNT"], width, label="True")
+        ax.bar(x + width / 2, dist["PRED_COUNT"], width, label="Predicted")
+        ax.set_title("True vs predicted label distribution")
+        ax.set_xticks(x)
+        ax.set_xticklabels(dist["LABEL"].astype(str), rotation=45, ha="right")
+        ax.set_ylabel("Rows")
+        ax.legend()
+        plt.tight_layout()
+        fp = plots_dir / "04_true_vs_predicted_label_distribution.png"
+        plt.savefig(fp, dpi=160)
+        plt.close(fig)
+        _append_plot(plot_rows, fp, "True vs predicted label distribution")
+
+    # 4) Multiclass one-vs-rest ROC and PR, if probabilities exist.
+    proba_labels, proba_cols = _get_proba_columns(test_pred)
+    if proba_cols:
+        y_score = test_pred[proba_cols].apply(pd.to_numeric, errors="coerce").fillna(0).values
+        y_true_s = y_true.map(sanitize_label)
+        y_bin = np.zeros((len(y_true_s), len(proba_labels)), dtype=int)
+        label_to_idx = {lbl: i for i, lbl in enumerate(proba_labels)}
+        for i, lbl in enumerate(y_true_s):
+            if lbl in label_to_idx:
+                y_bin[i, label_to_idx[lbl]] = 1
+        auc_rows = []
+        roc_curve_rows = []
+        pr_curve_rows = []
+        valid_class_indices = []
+        for j, lbl in enumerate(proba_labels):
+            if y_bin[:, j].sum() == 0 or y_bin[:, j].sum() == len(y_bin):
+                continue
+            valid_class_indices.append(j)
+            try:
+                fpr, tpr, roc_thr = roc_curve(y_bin[:, j], y_score[:, j])
+                precision, recall, pr_thr = precision_recall_curve(y_bin[:, j], y_score[:, j])
+                roc_auc = auc(fpr, tpr)
+                pr_auc = average_precision_score(y_bin[:, j], y_score[:, j])
+                auc_rows.append({"CLASS": lbl, "ROC_AUC_OVR": float(roc_auc), "PR_AUC_OVR": float(pr_auc), "POSITIVE_ROWS": int(y_bin[:, j].sum())})
+                roc_curve_rows.extend({"CLASS": lbl, "FPR": float(a), "TPR": float(b), "THRESHOLD": float(c)} for a, b, c in zip(fpr, tpr, roc_thr))
+                pr_curve_rows.extend({"CLASS": lbl, "PRECISION": float(a), "RECALL": float(b), "THRESHOLD": float(pr_thr[k]) if k < len(pr_thr) else np.nan} for k, (a, b) in enumerate(zip(precision, recall)))
+            except Exception:
+                continue
+        if auc_rows:
+            auc_df = pd.DataFrame(auc_rows).sort_values("ROC_AUC_OVR", ascending=False)
+            auc_df.to_csv(out_dir / "cesmlc_v6_ml_multiclass_ovr_auc_metrics.csv", index=False)
+            pd.DataFrame(roc_curve_rows).to_csv(out_dir / "cesmlc_v6_ml_multiclass_ovr_roc_points.csv", index=False)
+            pd.DataFrame(pr_curve_rows).to_csv(out_dir / "cesmlc_v6_ml_multiclass_ovr_pr_points.csv", index=False)
+
+            # Plot top classes by support and/or AUC.
+            plot_classes = auc_df.sort_values("POSITIVE_ROWS", ascending=False).head(8)["CLASS"].tolist()
+            roc_df = pd.DataFrame(roc_curve_rows)
+            fig = plt.figure(figsize=(9, 7))
+            ax = fig.add_subplot(111)
+            for lbl in plot_classes:
+                d = roc_df[roc_df["CLASS"] == lbl]
+                auc_val = auc_df.loc[auc_df["CLASS"] == lbl, "ROC_AUC_OVR"].iloc[0]
+                ax.plot(d["FPR"], d["TPR"], label=f"{lbl} AUC={auc_val:.3f}")
+            ax.plot([0, 1], [0, 1], linestyle="--", label="Random")
+            ax.set_title("Multiclass one-vs-rest ROC curves - top classes by support")
+            ax.set_xlabel("False positive rate")
+            ax.set_ylabel("True positive rate")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            fp = plots_dir / "05_multiclass_ovr_roc_top_classes.png"
+            plt.savefig(fp, dpi=160)
+            plt.close(fig)
+            _append_plot(plot_rows, fp, "One-vs-rest ROC curves for top classes")
+
+            pr_df = pd.DataFrame(pr_curve_rows)
+            fig = plt.figure(figsize=(9, 7))
+            ax = fig.add_subplot(111)
+            for lbl in plot_classes:
+                d = pr_df[pr_df["CLASS"] == lbl]
+                pr_val = auc_df.loc[auc_df["CLASS"] == lbl, "PR_AUC_OVR"].iloc[0]
+                ax.plot(d["RECALL"], d["PRECISION"], label=f"{lbl} AP={pr_val:.3f}")
+            ax.set_title("Multiclass one-vs-rest precision-recall curves - top classes by support")
+            ax.set_xlabel("Recall")
+            ax.set_ylabel("Precision")
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            fp = plots_dir / "06_multiclass_ovr_precision_recall_top_classes.png"
+            plt.savefig(fp, dpi=160)
+            plt.close(fig)
+            _append_plot(plot_rows, fp, "One-vs-rest precision-recall curves for top classes")
+
+    # 5) Operational binary view: problem labels vs non-problem/suppressor/hold.
+    test_for_binary = pd.concat([test_df.reset_index(drop=True), test_pred.reset_index(drop=True)], axis=1)
+    test_for_binary = add_score_columns(test_for_binary)
+    y_problem = test_for_binary["FINAL_TRAINING_LABEL"].astype(str).map(sanitize_label).isin(PROBLEM_LABELS).astype(int).values
+    p_problem = pd.to_numeric(test_for_binary["ML_PROBLEM_PROBABILITY"], errors="coerce").fillna(0).values
+    if len(np.unique(y_problem)) == 2:
+        fpr, tpr, roc_thr = roc_curve(y_problem, p_problem)
+        precision, recall, pr_thr = precision_recall_curve(y_problem, p_problem)
+        bin_metrics = {
+            "BINARY_PROBLEM_ROC_AUC": float(roc_auc_score(y_problem, p_problem)),
+            "BINARY_PROBLEM_AVERAGE_PRECISION": float(average_precision_score(y_problem, p_problem)),
+            "POSITIVE_PROBLEM_ROWS": int(y_problem.sum()),
+            "NEGATIVE_ROWS": int((1 - y_problem).sum()),
+        }
+        pd.DataFrame([bin_metrics]).to_csv(out_dir / "cesmlc_v6_ml_problem_vs_nonproblem_auc_metrics.csv", index=False)
+        pd.DataFrame({"FPR": fpr, "TPR": tpr, "THRESHOLD": roc_thr}).to_csv(out_dir / "cesmlc_v6_ml_problem_vs_nonproblem_roc_points.csv", index=False)
+        pd.DataFrame({"PRECISION": precision, "RECALL": recall, "THRESHOLD": list(pr_thr) + [np.nan]}).to_csv(out_dir / "cesmlc_v6_ml_problem_vs_nonproblem_pr_points.csv", index=False)
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111)
+        ax.plot(fpr, tpr, label=f"ROC AUC={bin_metrics['BINARY_PROBLEM_ROC_AUC']:.3f}")
+        ax.plot([0, 1], [0, 1], linestyle="--", label="Random")
+        ax.set_title("Problem vs non-problem ROC")
+        ax.set_xlabel("False positive rate")
+        ax.set_ylabel("True positive rate")
+        ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout()
+        fp = plots_dir / "07_problem_vs_nonproblem_roc.png"
+        plt.savefig(fp, dpi=160); plt.close(fig)
+        _append_plot(plot_rows, fp, "Operational binary ROC: problem labels vs non-problem/suppressed")
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111)
+        ax.plot(recall, precision, label=f"AP={bin_metrics['BINARY_PROBLEM_AVERAGE_PRECISION']:.3f}")
+        ax.set_title("Problem vs non-problem precision-recall")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout()
+        fp = plots_dir / "08_problem_vs_nonproblem_precision_recall.png"
+        plt.savefig(fp, dpi=160); plt.close(fig)
+        _append_plot(plot_rows, fp, "Operational binary precision-recall: problem labels vs non-problem/suppressed")
+
+        threshold_rows = []
+        for t in np.linspace(0, 1, 101):
+            pred_bin = (p_problem >= t).astype(int)
+            tp = int(((pred_bin == 1) & (y_problem == 1)).sum())
+            fpv = int(((pred_bin == 1) & (y_problem == 0)).sum())
+            tn = int(((pred_bin == 0) & (y_problem == 0)).sum())
+            fn = int(((pred_bin == 0) & (y_problem == 1)).sum())
+            threshold_rows.append({
+                "THRESHOLD": float(t), "TP": tp, "FP": fpv, "TN": tn, "FN": fn,
+                "PRECISION": float(tp / max(tp + fpv, 1)),
+                "RECALL": float(tp / max(tp + fn, 1)),
+                "FPR": float(fpv / max(fpv + tn, 1)),
+            })
+        threshold_df = pd.DataFrame(threshold_rows)
+        threshold_df.to_csv(out_dir / "cesmlc_v6_ml_problem_threshold_metrics.csv", index=False)
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        for c in ["PRECISION", "RECALL", "FPR"]:
+            ax.plot(threshold_df["THRESHOLD"], threshold_df[c], label=c)
+        ax.set_title("Problem probability threshold curves")
+        ax.set_xlabel("Problem probability threshold")
+        ax.set_ylabel("Rate")
+        ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout()
+        fp = plots_dir / "09_problem_threshold_rates.png"
+        plt.savefig(fp, dpi=160); plt.close(fig)
+        _append_plot(plot_rows, fp, "Precision/recall/FPR by problem-probability threshold")
+
+    # 6) Confidence calibration / coverage.
+    conf_df = pd.DataFrame({"CONFIDENCE": pd.to_numeric(test_pred.get("MODEL_CONFIDENCE", pd.Series(np.nan, index=test_pred.index)), errors="coerce"), "CORRECT": (y_true.values == y_pred.values).astype(int)})
+    conf_df = conf_df.dropna()
+    if not conf_df.empty:
+        rows = []
+        for t in np.linspace(0, 1, 21):
+            part = conf_df[conf_df["CONFIDENCE"] >= t]
+            rows.append({"CONFIDENCE_THRESHOLD": float(t), "COVERAGE_ROWS": int(len(part)), "COVERAGE_RATE": float(len(part) / max(len(conf_df), 1)), "ACCURACY": float(part["CORRECT"].mean()) if len(part) else np.nan})
+        coverage_df = pd.DataFrame(rows)
+        coverage_df.to_csv(out_dir / "cesmlc_v6_ml_confidence_coverage_accuracy.csv", index=False)
+        fig = plt.figure(figsize=(10, 6))
+        ax = fig.add_subplot(111)
+        ax.plot(coverage_df["CONFIDENCE_THRESHOLD"], coverage_df["ACCURACY"], label="Accuracy")
+        ax.plot(coverage_df["CONFIDENCE_THRESHOLD"], coverage_df["COVERAGE_RATE"], label="Coverage rate")
+        ax.set_title("Accuracy and coverage by model-confidence threshold")
+        ax.set_xlabel("Model confidence threshold")
+        ax.set_ylabel("Rate")
+        ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout()
+        fp = plots_dir / "10_confidence_coverage_accuracy.png"
+        plt.savefig(fp, dpi=160); plt.close(fig)
+        _append_plot(plot_rows, fp, "Accuracy and coverage by model confidence threshold")
+
+    # 7) Score distributions on all scored rows.
+    for col, fname, title in [
+        ("ML_FINAL_PROBLEM_SCORE", "11_final_problem_score_distribution.png", "ML final problem score distribution"),
+        ("ML_PROBLEM_PROBABILITY", "12_problem_probability_distribution.png", "ML problem probability distribution"),
+        ("MODEL_CONFIDENCE", "13_model_confidence_distribution.png", "Model confidence distribution"),
+    ]:
+        if col in scored.columns:
+            vals = pd.to_numeric(scored[col], errors="coerce").dropna()
+            if not vals.empty:
+                fig = plt.figure(figsize=(9, 6))
+                ax = fig.add_subplot(111)
+                ax.hist(vals, bins=50)
+                ax.set_title(title)
+                ax.set_xlabel(col)
+                ax.set_ylabel("Rows")
+                ax.grid(True, alpha=0.3)
+                plt.tight_layout()
+                fp = plots_dir / fname
+                plt.savefig(fp, dpi=160); plt.close(fig)
+                _append_plot(plot_rows, fp, title)
+
+    # 8) Feature importance plot.
+    if feature_importance is not None and not feature_importance.empty and "IMPORTANCE" in feature_importance.columns:
+        fi = feature_importance.copy()
+        fi["IMPORTANCE"] = pd.to_numeric(fi["IMPORTANCE"], errors="coerce")
+        fi = fi.dropna(subset=["IMPORTANCE"]).sort_values("IMPORTANCE", ascending=False).head(30)
+        if not fi.empty:
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111)
+            ax.barh(fi["FEATURE"].astype(str)[::-1], fi["IMPORTANCE"].values[::-1])
+            ax.set_title("Top model feature importance")
+            ax.set_xlabel("Importance")
+            plt.tight_layout()
+            fp = plots_dir / "14_feature_importance_top30.png"
+            plt.savefig(fp, dpi=160); plt.close(fig)
+            _append_plot(plot_rows, fp, "Top 30 model feature importances")
+
+    plot_index = pd.DataFrame(plot_rows)
+    plot_index.to_csv(out_dir / "cesmlc_v6_ml_plot_index.csv", index=False)
+    return plot_index
+
+
+
+def pseudo_label_and_retrain(model, backend: str, train_model_df: pd.DataFrame, valid_model_df: pd.DataFrame, unlabeled_df: pd.DataFrame, features: List[str], categorical_features: List[str], ModelClass, args: argparse.Namespace):
+    if unlabeled_df.empty:
+        log("Pseudo-labeling skipped: no unlabeled/hold rows available.", indent=1)
+        return model, pd.DataFrame()
+    pred = predict_model(model, backend, unlabeled_df, features, categorical_features)
+    scored_unlabeled = pd.concat([unlabeled_df.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+    scored_unlabeled = add_score_columns(scored_unlabeled)
+    pseudo = scored_unlabeled[
+        (scored_unlabeled["MODEL_CONFIDENCE"] >= float(args.pseudo_label_min_confidence))
+        & (~scored_unlabeled["MODEL_PREDICTED_LABEL"].isin(DEFAULT_HOLD_LABELS))
+    ].copy()
+    if args.pseudo_label_max_rows > 0 and len(pseudo) > args.pseudo_label_max_rows:
+        pseudo = pseudo.sort_values("MODEL_CONFIDENCE", ascending=False).head(args.pseudo_label_max_rows).copy()
+    if pseudo.empty:
+        log("Pseudo-labeling found no rows above threshold.", indent=1)
+        return model, pseudo
+    pseudo["FINAL_TRAINING_LABEL"] = pseudo["MODEL_PREDICTED_LABEL"].astype(str)
+    pseudo["LABEL_SOURCE_FOR_MODEL"] = "pseudo_label"
+    pseudo["TRAINING_WEIGHT"] = float(args.pseudo_label_weight) * pd.to_numeric(pseudo["MODEL_CONFIDENCE"], errors="coerce").fillna(0.0)
+    log(f"Pseudo-label rows added for retraining: {len(pseudo):,}", indent=1)
+    augmented_train = pd.concat([train_model_df, pseudo[train_model_df.columns.intersection(pseudo.columns)]], ignore_index=True, sort=False)
+    # Ensure missing columns from train are present in pseudo concat result.
+    for c in train_model_df.columns:
+        if c not in augmented_train.columns:
+            augmented_train[c] = train_model_df[c].iloc[0] if len(train_model_df) else 0
+    model2 = fit_model(augmented_train, valid_model_df, "FINAL_TRAINING_LABEL", features, categorical_features, backend, ModelClass, args)
+    return model2, pseudo
+
+
+def write_training_report(out_dir: Path, dataset: pd.DataFrame, train_pool: pd.DataFrame, scored: pd.DataFrame, model_info: Dict[str, Any], rare_df: pd.DataFrame, pseudo_df: pd.DataFrame, plot_index: Optional[pd.DataFrame] = None) -> None:
+    lines: List[str] = []
+    lines.append("# CESMLC V7 Problem-State ML Training Report")
+    lines.append("")
+    lines.append(f"Script version: `{SCRIPT_VERSION}`")
+    lines.append(f"Backend: `{model_info.get('backend')}`")
+    lines.append("")
+    lines.append("## Purpose")
+    lines.append("This model learns V7 problem-state seed/manual labels. It is not the old Phase 1 source-change counter and it does not train directly on old Phase 1 rule labels.")
+    lines.append("V6.2 supports RAN source-of-truth compatibility columns and the refined default-fallback labels: short/long term Ã source exists/source missing.")
+    lines.append("")
+    lines.append("## Dataset summary")
+    lines.append(f"- All candidate ECGI-feature rows: **{len(dataset):,}**")
+    lines.append(f"- Training pool rows: **{len(train_pool):,}**")
+    lines.append(f"- Scored rows: **{len(scored):,}**")
+    lines.append(f"- Model features: **{len(model_info.get('features', [])):,}**")
+    lines.append(f"- Categorical features: **{', '.join(model_info.get('categorical_features', []))}**")
+    lines.append(f"- Direct seed-rule flags included as features: **{model_info.get('include_rule_flags')}**")
+    lines.append("")
+    lines.append("## Training label distribution")
+    for label, count in train_pool["FINAL_TRAINING_LABEL"].value_counts().items():
+        lines.append(f"- **{label}**: {int(count):,}")
+    lines.append("")
+    if not rare_df.empty:
+        lines.append("## Rare labels")
+        for _, r in rare_df.iterrows():
+            lines.append(f"- **{r['FINAL_TRAINING_LABEL']}**: {int(r['ROW_COUNT'])}")
+        lines.append("")
+    lines.append("## Test metrics")
+    for k, v in model_info.get("test_metrics", {}).items():
+        lines.append(f"- {k}: `{v}`")
+    lines.append("")
+    if plot_index is not None and not plot_index.empty:
+        lines.append("## Diagnostic plots")
+        lines.append("Open the `plots/` folder and `cesmlc_v6_ml_plot_index.csv` for the complete plot list.")
+        for _, pr in plot_index.head(30).iterrows():
+            lines.append(f"- `{pr.get('PLOT_FILE', '')}` â {pr.get('DESCRIPTION', '')}")
+        lines.append("")
+    if not pseudo_df.empty:
+        lines.append("## Pseudo-labeling")
+        lines.append(f"- Pseudo-labeled rows used for retraining: **{len(pseudo_df):,}**")
+        for label, count in pseudo_df["FINAL_TRAINING_LABEL"].value_counts().items():
+            lines.append(f"  - {label}: {int(count):,}")
+        lines.append("")
+    lines.append("## Top scored problem rows")
+    top_cols = [
+        "ML_PROBLEM_RANK", "ECGI_LABEL", "ECGI", "FEATURE", "SEED_LABEL", "FINAL_TRAINING_LABEL",
+        "MODEL_PREDICTED_LABEL", "MODEL_CONFIDENCE", "ML_PROBLEM_PROBABILITY", "ML_FINAL_PROBLEM_SCORE",
+        "SERVER_ID", "MARKET", "LATEST_SOURCE_VALUE", "PREVIOUS_NONLATEST_SOURCE_VALUE", "LATEST_DB_VALUE",
+        "DATA_SOURCE_COMPATIBILITY", "REFERENCE_SOURCE_NAME", "REFERENCE_COLUMN", "REFERENCE_VALUE",
+        "FALLBACK_DURATION_CLUSTER", "FALLBACK_SOURCE_DATA_CLUSTER", "SITE_WIDE_LONG_TERM_DEFAULT_FALLBACK_SUSPECT_FLAG",
+        "SOURCE_CHANGE_DAYS_COUNT", "DISTINCT_SOURCE_VALUES_30D",
+    ]
+    for _, r in scored.head(25).iterrows():
+        parts = []
+        for c in top_cols:
+            if c in scored.columns:
+                parts.append(f"{c}={r.get(c, '')}")
+        lines.append("- " + " | ".join(parts))
+    lines.append("")
+    lines.append("## Output files")
+    for fname in [
+        "cesmlc_v6_ml_scores_all.csv",
+        "cesmlc_v6_ml_scores_top300.csv",
+        "cesmlc_v6_ml_test_predictions.csv",
+        "cesmlc_v6_ml_classification_report.csv",
+        "cesmlc_v6_ml_confusion_matrix.csv",
+        "cesmlc_v6_ml_feature_importance.csv",
+        "cesmlc_v6_ml_plot_index.csv",
+        "plots/",
+        "cesmlc_v6_problem_state_model_artifact.pkl",
+    ]:
+        lines.append(f"- `{fname}`")
+    (out_dir / "cesmlc_v6_ml_training_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def train_and_score(dataset: pd.DataFrame, train_pool: pd.DataFrame, rare_df: pd.DataFrame, out_dir: Path, args: argparse.Namespace) -> Dict[str, Any]:
+    header("STEP 2 - TRAIN / EVALUATE / SCORE V6 PROBLEM-STATE MODEL")
+    backend, ModelClass = get_backend(args.model)
+    log(f"Selected backend: {backend}", indent=1)
+    features, categorical_features, numeric_features = select_feature_columns(train_pool, include_rule_flags=args.include_rule_flags)
+    log(f"Model feature count: {len(features):,}", indent=1)
+    log(f"Categorical features: {categorical_features}", indent=1)
+    log(f"Numeric feature count: {len(numeric_features):,}", indent=1)
+
+    train_df, test_df = train_test_split_safe(train_pool, "FINAL_TRAINING_LABEL", args.test_size, args.random_state)
+    train_model_df, valid_model_df = train_test_split_safe(train_df, "FINAL_TRAINING_LABEL", args.eval_size, args.random_state + 17)
+    log(f"Train rows total: {len(train_df):,}", indent=1)
+    log(f"Model-train rows: {len(train_model_df):,}", indent=1)
+    log(f"Validation rows: {len(valid_model_df):,}", indent=1)
+    log(f"Test rows: {len(test_df):,}", indent=1)
+
+    model = fit_model(train_model_df, valid_model_df, "FINAL_TRAINING_LABEL", features, categorical_features, backend, ModelClass, args)
+    pseudo_df = pd.DataFrame()
+    if args.enable_pseudo_labeling:
+        train_keys = set(zip(train_pool["ECGI"].astype(str), train_pool["FEATURE"].astype(str)))
+        all_unlabeled = dataset[~dataset.apply(lambda r: (str(r["ECGI"]), str(r["FEATURE"])) in train_keys, axis=1)].copy()
+        model, pseudo_df = pseudo_label_and_retrain(model, backend, train_model_df, valid_model_df, all_unlabeled, features, categorical_features, ModelClass, args)
+
+    test_pred = predict_model(model, backend, test_df, features, categorical_features)
+    test_metrics = evaluate_predictions(test_df["FINAL_TRAINING_LABEL"], test_pred, out_dir, "cesmlc_v6_ml")
+    test_output = pd.concat([test_df.reset_index(drop=True), test_pred.reset_index(drop=True)], axis=1)
+    test_output.to_csv(out_dir / "cesmlc_v6_ml_test_predictions.csv", index=False)
+    log(f"Test metrics: {test_metrics}", indent=1)
+
+    all_pred = predict_model(model, backend, dataset, features, categorical_features)
+    scored = pd.concat([dataset.reset_index(drop=True), all_pred.reset_index(drop=True)], axis=1)
+    scored = add_score_columns(scored)
+    scored = scored.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    scored.insert(0, "ML_PROBLEM_RANK", np.arange(1, len(scored) + 1))
+    scored.to_csv(out_dir / "cesmlc_v6_ml_scores_all.csv", index=False)
+    scored.head(args.top_n).to_csv(out_dir / "cesmlc_v6_ml_scores_top300.csv", index=False)
+
+    feature_importance = get_feature_importance(model, backend, features)
+    feature_importance.to_csv(out_dir / "cesmlc_v6_ml_feature_importance.csv", index=False)
+
+    plot_index = create_diagnostic_plots(
+        out_dir=out_dir,
+        model=model,
+        backend=backend,
+        test_df=test_df,
+        test_pred=test_pred,
+        scored=scored,
+        feature_importance=feature_importance,
+        args=args,
+    )
+
+    artifact = {
+        "script_version": SCRIPT_VERSION,
+        "backend": backend,
+        "features": features,
+        "categorical_features": categorical_features,
+        "numeric_features": numeric_features,
+        "include_rule_flags": bool(args.include_rule_flags),
+        "model": model,
+        "test_metrics": test_metrics,
+        "problem_labels": sorted(PROBLEM_LABELS),
+        "suppressor_labels": sorted(SUPPRESSOR_LABELS),
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    artifact_path = out_dir / "cesmlc_v6_problem_state_model_artifact.pkl"
+    with open(artifact_path, "wb") as f:
+        pickle.dump(artifact, f)
+    log(f"Saved model artifact: {artifact_path}", indent=1)
+
+    # Report tables.
+    label_summary = train_pool.groupby(["FINAL_TRAINING_LABEL", "LABEL_SOURCE_FOR_MODEL"], as_index=False).agg(
+        ROW_COUNT=("ECGI", "size"),
+        UNIQUE_ECGI=("ECGI", "nunique"),
+        AVG_WEIGHT=("TRAINING_WEIGHT", "mean"),
+        AVG_CONFIDENCE=("SEED_LABEL_CONFIDENCE", "mean"),
+    ).sort_values("ROW_COUNT", ascending=False)
+    label_summary.to_csv(out_dir / "cesmlc_v6_ml_training_label_summary.csv", index=False)
+    if "DATA_SOURCE_COMPATIBILITY" in dataset.columns:
+        # Build from scored so model score is available.
+        ds_summary = scored.groupby(["MODEL_PREDICTED_LABEL", "DATA_SOURCE_COMPATIBILITY"], dropna=False).agg(
+            ROW_COUNT=("ECGI", "size"),
+            UNIQUE_ECGI=("ECGI", "nunique"),
+            AVG_ML_PROBLEM_PROBABILITY=("ML_PROBLEM_PROBABILITY", "mean"),
+            AVG_ML_FINAL_PROBLEM_SCORE=("ML_FINAL_PROBLEM_SCORE", "mean"),
+        ).reset_index().sort_values(["MODEL_PREDICTED_LABEL", "ROW_COUNT"], ascending=[True, False])
+        ds_summary.to_csv(out_dir / "cesmlc_v6_ml_data_source_compatibility_summary.csv", index=False)
+
+    model_info = {
+        "backend": backend,
+        "features": features,
+        "categorical_features": categorical_features,
+        "numeric_features": numeric_features,
+        "include_rule_flags": bool(args.include_rule_flags),
+        "test_metrics": test_metrics,
+        "artifact_path": str(artifact_path),
+    }
+    write_training_report(out_dir, dataset, train_pool, scored, model_info, rare_df, pseudo_df, plot_index)
+    return model_info
+
+
+def score_mode(dataset_path: Path, artifact_path: Path, out_dir: Path, top_n: int) -> None:
+    header("SCORE MODE - LOAD V6 MODEL ARTIFACT AND SCORE DATASET")
+    dataset = read_csv_clean(dataset_path)
+    with open(artifact_path, "rb") as f:
+        artifact = pickle.load(f)
+    model = artifact["model"]
+    backend = artifact["backend"]
+    features = artifact["features"]
+    categorical_features = artifact["categorical_features"]
+    pred = predict_model(model, backend, dataset, features, categorical_features)
+    scored = pd.concat([dataset.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+    scored = add_score_columns(scored)
+    scored = scored.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    scored.insert(0, "ML_PROBLEM_RANK", np.arange(1, len(scored) + 1))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    scored.to_csv(out_dir / "cesmlc_v6_scored_dataset_all.csv", index=False)
+    scored.head(top_n).to_csv(out_dir / "cesmlc_v6_scored_dataset_top.csv", index=False)
+    log(f"Scored rows: {len(scored):,}", indent=1)
+    log(f"Output: {out_dir / 'cesmlc_v6_scored_dataset_top.csv'}", indent=1)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CESMLC V6 weak/semi-supervised problem-state model trainer.")
+    p.add_argument("--mode", default="train", choices=["train", "score"], help="train or score")
+    p.add_argument("--dataset", required=True, type=str, help="V6 seed-label dataset CSV or scoring dataset.")
+    p.add_argument("--out-dir", required=True, type=str, help="Output folder.")
+    p.add_argument("--manual-labels", default=None, type=str, help="Optional manual label CSV with ECGI, FEATURE, MANUAL_LABEL.")
+    p.add_argument("--model-artifact", default=None, type=str, help="Existing artifact for --mode score.")
+
+    p.add_argument("--model", default="auto", choices=["auto", "catboost", "lightgbm", "sklearn_rf", "mlp", "tabtransformer", "fttransformer", "tabnet"])
+    p.add_argument("--test-size", default=0.25, type=float)
+    p.add_argument("--eval-size", default=0.20, type=float)
+    p.add_argument("--random-state", default=42, type=int)
+    p.add_argument("--min-class-count", default=20, type=int, help="Drop seed labels with fewer rows unless --keep-rare-labels is used.")
+    p.add_argument("--keep-rare-labels", action="store_true")
+    p.add_argument("--include-hold-labels", action="store_true", help="Train on hold/needs-review labels. Default excludes them unless manual.")
+    p.add_argument("--include-rule-flags", action="store_true", help="Include direct seed-rule indicator flags. Off by default to avoid memorizing seed rules.")
+
+    p.add_argument("--iterations", default=1000, type=int)
+    p.add_argument("--depth", default=6, type=int)
+    p.add_argument("--learning-rate", default=0.04, type=float)
+    p.add_argument("--num-leaves", default=63, type=int)
+    p.add_argument("--early-stopping-rounds", default=80, type=int)
+    p.add_argument("--train-verbose", default=25, type=int)
+
+    p.add_argument("--rf-estimators", default=400, type=int)
+    p.add_argument("--rf-max-depth", default=0, type=int)
+    p.add_argument("--rf-min-samples-leaf", default=2, type=int)
+    p.add_argument("--onehot-min-frequency", default=5, type=int)
+
+    p.add_argument("--torch-epochs", default=120, type=int)
+    p.add_argument("--torch-batch-size", default=512, type=int)
+    p.add_argument("--torch-lr", default=0.001, type=float)
+    p.add_argument("--torch-device", default="auto", type=str, help="auto, cpu, or cuda")
+
+    p.add_argument("--tabnet-epochs", default=120, type=int)
+    p.add_argument("--tabnet-batch-size", default=2048, type=int)
+    p.add_argument("--tabnet-lr", default=0.01, type=float)
+
+    p.add_argument("--no-plots", action="store_true", help="Skip PNG diagnostic plots. CSV reports are still written.")
+
+    p.add_argument("--enable-pseudo-labeling", action="store_true")
+    p.add_argument("--pseudo-label-min-confidence", default=0.92, type=float)
+    p.add_argument("--pseudo-label-weight", default=0.35, type=float)
+    p.add_argument("--pseudo-label-max-rows", default=100000, type=int)
+
+    p.add_argument("--top-n", default=300, type=int)
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    out_dir = Path(args.out_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = Path(args.dataset).expanduser()
+    if not dataset_path.exists():
+        raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
+    if args.mode == "score":
+        if not args.model_artifact:
+            raise ValueError("--mode score requires --model-artifact")
+        artifact_path = Path(args.model_artifact).expanduser()
+        if not artifact_path.exists():
+            raise FileNotFoundError(f"Model artifact not found: {artifact_path}")
+        score_mode(dataset_path, artifact_path, out_dir, args.top_n)
+        return 0
+
+    header("CESMLC V6 PROBLEM-STATE WEAK/SEMI-SUPERVISED ML TRAINER")
+    log(f"Dataset: {dataset_path}")
+    log(f"Output: {out_dir}")
+    log(f"Model choice: {args.model}")
+    log(f"Direct seed-rule flags included: {bool(args.include_rule_flags)}")
+    log(f"Pseudo-labeling enabled: {bool(args.enable_pseudo_labeling)}")
+
+    manual_path = Path(args.manual_labels).expanduser() if args.manual_labels else None
+    dataset, train_pool, rare_df = load_and_prepare_dataset(
+        dataset_path=dataset_path,
+        manual_labels_path=manual_path,
+        min_class_count=args.min_class_count,
+        keep_rare_labels=args.keep_rare_labels,
+        exclude_hold_labels=not args.include_hold_labels,
+    )
+    dataset.to_csv(out_dir / "cesmlc_v6_ml_input_dataset_with_final_labels.csv", index=False)
+    train_pool.to_csv(out_dir / "cesmlc_v6_ml_training_pool.csv", index=False)
+    rare_df.to_csv(out_dir / "cesmlc_v6_ml_rare_labels.csv", index=False)
+
+    model_info = train_and_score(dataset, train_pool, rare_df, out_dir, args)
+    config = vars(args).copy()
+    config["script_version"] = SCRIPT_VERSION
+    config["model_info"] = {k: v for k, v in model_info.items() if k not in {"features", "categorical_features", "numeric_features"}}
+    (out_dir / "cesmlc_v6_ml_run_config.json").write_text(json.dumps(config, indent=2, default=str), encoding="utf-8")
+
+    header("DONE")
+    log(f"Total runtime: {elapsed_text()}")
+    log(f"Open first: {out_dir / 'cesmlc_v6_ml_training_report.md'}")
+    log(f"Open second: {out_dir / 'cesmlc_v6_ml_scores_top300.csv'}")
+    log(f"Open third: {out_dir / 'cesmlc_v6_ml_feature_importance.csv'}")
+    log(f"Deployable artifact: {out_dir / 'cesmlc_v6_problem_state_model_artifact.pkl'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
