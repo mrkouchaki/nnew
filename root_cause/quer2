@@ -1,5 +1,9 @@
 
 
+
+
+
+
 For ECGI 310410253519882, ANTENNALAT/ANTENNALON instability is caused by changing RBSS_LATITUDE/RBSS_LONGITUDE values coming from CSSNG_LEVO_SNW_STG1 into CSSNG_LEVO_SNW_STG, then into CSSNG_DATA_ADDITION and CSSNG_LTE_DATA/HIST. CSSNG_DATA_DEEP_STAGING is not the source for this ECGI. The visible Oracle root is CSSNG_LEVO_SNW_STG1. The true upstream root is the external loader/feed that refreshes CSSNG_LEVO_SNW_STG1.
 
 /* ============================================================
@@ -267,3 +271,22 @@ SELECT
     COUNT(*) AS row_count
 FROM e911.cssng_data_deep_staging
 WHERE ecgi_cell_global_identity = '310410253519882';
+
+
+
+SELECT
+    owner,
+    name,
+    type,
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND name = 'LOAD_CSSNG_LEVO_SNW_DATA'
+  AND type = 'PROCEDURE'
+  AND (
+        UPPER(text) LIKE '%SNWFLK_PROD_LEVO%'
+     OR UPPER(text) LIKE '%LEVO_REPORTING_PROD_RST%'
+     OR UPPER(text) LIKE '%ENMT_BRD_RSTE%'
+  )
+ORDER BY line;
