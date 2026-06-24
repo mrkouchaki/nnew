@@ -234,5 +234,29 @@ ORDER BY line;
 
 
 
+SELECT
+    ecgi_cell_global_identity,
+    rbss_latitude,
+    rbss_longitude,
+    COUNT(*) AS row_count
+FROM E911.CSSNG_LEVO_SNW_STG
+WHERE ecgi_cell_global_identity = '310410253519882'
+GROUP BY
+    ecgi_cell_global_identity,
+    rbss_latitude,
+    rbss_longitude
+ORDER BY row_count DESC;
 
+
+
+
+SELECT
+    referenced_owner,
+    referenced_name,
+    referenced_type
+FROM all_dependencies
+WHERE owner = 'E911'
+  AND name = 'WH_UPDATE_CSSNG_DATA_ADDITION'
+  AND type = 'PROCEDURE'
+ORDER BY referenced_type, referenced_name;
 
