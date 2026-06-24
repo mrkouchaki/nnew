@@ -412,7 +412,34 @@ ORDER BY rec_date DESC;
 
 
 
+ffffffffffffffffffffffffffff
 
+now 
+SELECT owner, object_name, object_type, created, last_ddl_time, status
+FROM all_objects
+WHERE owner = 'E911'
+  AND object_name IN (
+      'CSSNG_LEVO_SNW_STG1',
+      'CSSNG_LEVO_SNW_STG',
+      'CSSNG_LEVO_SNW',
+      'LOAD_CSSNG_LEVO_SNW_DATA',
+      'WH_UPDATE_CSSNG_DATA_ADDITION'
+  )
+ORDER BY object_type, object_name;
+
+
+
+SELECT table_owner, table_name, inserts, updates, deletes, timestamp
+FROM all_tab_modifications
+WHERE table_owner = 'E911'
+  AND table_name IN (
+      'CSSNG_LEVO_SNW_STG1',
+      'CSSNG_LEVO_SNW_STG',
+      'CSSNG_LEVO_SNW'
+  );
+
+
+For ECGI 310410253519882, ANTENNALAT/ANTENNALON instability is caused by changing RBSS_LATITUDE/RBSS_LONGITUDE values coming from CSSNG_LEVO_SNW_STG1 into CSSNG_LEVO_SNW_STG, then into CSSNG_DATA_ADDITION and CSSNG_LTE_DATA/HIST. CSSNG_DATA_DEEP_STAGING is not the source for this ECGI. The visible Oracle root is CSSNG_LEVO_SNW_STG1. The true upstream root is the external loader/feed that refreshes CSSNG_LEVO_SNW_STG1.
 
 
 
