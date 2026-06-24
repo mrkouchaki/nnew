@@ -260,3 +260,75 @@ WHERE owner = 'E911'
   AND type = 'PROCEDURE'
 ORDER BY referenced_type, referenced_name;
 
+
+
+
+
+SELECT
+    owner,
+    name,
+    type,
+    line,
+    text
+FROM all_source
+WHERE owner = 'E911'
+  AND REGEXP_LIKE(
+        UPPER(text),
+        '(INSERT\s+INTO|MERGE\s+INTO|UPDATE|TRUNCATE\s+TABLE)\s+CSSNG_LEVO_SNW_STG1'
+      )
+ORDER BY name, type, line;
+
+
+
+
+
+rrrrrrrrrrrrrrrrrr
+
+
+SELECT owner, name, type, line, text
+FROM all_source
+WHERE owner = 'E911'
+  AND UPPER(text) LIKE '%CSSNG_LEVO_SNW_STG1%'
+ORDER BY name, type, line;
+
+
+
+SELECT owner, name, type, line, text
+FROM all_source
+WHERE owner = 'E911'
+  AND (
+       UPPER(text) LIKE '%CSSNG_LEVO_SNW%'
+    OR UPPER(text) LIKE '%LEVO_SNW%'
+    OR UPPER(text) LIKE '%SNWFLK%'
+  )
+ORDER BY name, type, line;
+
+SELECT
+    owner,
+    name,
+    type,
+    referenced_owner,
+    referenced_name,
+    referenced_type
+FROM all_dependencies
+WHERE referenced_owner = 'E911'
+  AND referenced_name IN (
+      'CSSNG_LEVO_SNW_STG1',
+      'CSSNG_LEVO_SNW_STG',
+      'CSSNG_DATA_DEEP_STAGING'
+  )
+ORDER BY referenced_name, owner, name, type;
+
+
+
+SELECT owner, object_name, object_type, created, last_ddl_time, status
+FROM all_objects
+WHERE owner = 'E911'
+  AND (
+       object_name LIKE '%LEVO_SNW%'
+    OR object_name LIKE '%SNWFLK%'
+    OR object_name LIKE '%SNOW%'
+    OR object_name LIKE '%DEEP_STAGING%'
+  )
+ORDER BY object_type, object_name;
+
