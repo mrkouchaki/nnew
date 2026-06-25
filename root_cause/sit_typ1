@@ -1,0 +1,86 @@
+import pandas as pd
+from pathlib import Path
+
+INPUT_FILE = Path(r"C:\temp\cesmlc_v6_2_fixed_seed_akr3aesme01_30d_outputs\cesmlc_v6_ecgi_incident_summary.csv")
+OUT_SQL = INPUT_FILE.with_name("get_site_type_for_ecgis.sql")
+
+TABLE_NAME = "E911.cssng_lte_data_hist"   # change to E911.cssng_lte_data_history if that is the real table
+CHUNK_SIZE = 500
+
+df = pd.read_csv(INPUT_FILE, dtype=str)
+
+ecgis = (
+    df["ECGI"]
+    .dropna()
+    .astype(str)
+    .str.strip()
+    .str.replace(r"\.0$", "", regex=True)
+    .unique()
+    .tolist()
+)
+
+# Stop if Excel damaged ECGI values
+bad = [x for x in ecgis if "E" in x.upper() or not x.isdigit()]
+if bad:
+    raise ValueError(f"Bad ECGI values found. Use original CSV, not Excel-saved file. Example: {bad[:5]}")
+
+chunks = [ecgis[i:i + CHUNK_SIZE] for i in range(0, len(ecgis), CHUNK_SIZE)]
+
+sql = []
+sql.append("WITH input_ecgis_raw AS (")
+
+for idx, chunk in enumerate(chunks):
+    if idx > 0:
+        sql.append("UNION ALL")
+
+    values = ",\n        ".join(f"'{x}'" for x in chunk)
+
+    sql.append(f"""
+    SELECT TO_NUMBER(column_value) AS ecgi
+    FROM TABLE(sys.odcivarchar2list(
+        {values}
+    ))
+""")
+
+sql.append(f"""
+),
+input_ecgis AS (
+    SELECT DISTINCT ecgi
+    FROM input_ecgis_raw
+),
+ranked_site AS (
+    SELECT
+        t.ecgi,
+        t.site_type,
+        t.pulldate,
+        ROW_NUMBER() OVER (
+            PARTITION BY t.ecgi
+            ORDER BY t.pulldate DESC
+        ) AS rn
+    FROM {TABLE_NAME} t
+    JOIN input_ecgis i
+      ON t.ecgi = i.ecgi
+    WHERE t.pulldate >= (
+        SELECT TRUNC(MAX(pulldate)) - 35
+        FROM {TABLE_NAME}
+    )
+)
+SELECT
+    i.ecgi,
+    r.site_type,
+    r.pulldate,
+    CASE
+        WHEN r.ecgi IS NULL THEN 'NOT_FOUND'
+        ELSE 'FOUND'
+    END AS match_status
+FROM input_ecgis i
+LEFT JOIN ranked_site r
+  ON r.ecgi = i.ecgi
+ AND r.rn = 1
+ORDER BY i.ecgi;
+""")
+
+OUT_SQL.write_text("\n".join(sql), encoding="utf-8")
+
+print(f"Created SQL file: {OUT_SQL}")
+print(f"ECGI count: {len(ecgis)}")
