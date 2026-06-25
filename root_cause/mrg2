@@ -1,0 +1,285 @@
+import pandas as pd
+from pathlib import Path
+
+# ==========================================================
+# FILE PATHS
+# ==========================================================
+
+CESMLC_FILE = Path(
+    r"C:\temp\cesmlc_v6_2_fixed_seed_akr3aesme01_30d_outputs\cesmlc_v6_ecgi_incident_summary_top.csv"
+)
+
+CSSNG_FILE = Path(
+    r"C:\temp\cssng_lte_data_hist_35d.csv"
+)
+
+OUT_FILE = CESMLC_FILE.with_name(
+    "cesmlc_v6_ecgi_incident_summary_top_with_site_type.csv"
+)
+
+CHUNK_SIZE = 500000
+
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def clean_columns(df):
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace('"', "", regex=False)
+        .str.strip()
+        .str.upper()
+    )
+    return df
+
+
+def clean_text(s):
+    s = (
+        s.astype("string")
+        .str.replace('"', "", regex=False)
+        .str.strip()
+    )
+    s = s.mask(s.str.upper().isin(["", "NAN", "NONE", "NULL"]))
+    return s
+
+
+def find_col(df, col_name):
+    target = col_name.strip().upper()
+
+    for c in df.columns:
+        if c.strip().upper() == target:
+            return c
+
+    print("\nERROR: Column not found:", col_name)
+    print("Available columns:")
+    for x in df.columns:
+        print("  -", repr(x))
+
+    raise ValueError(f"Column not found: {col_name}")
+
+
+# ==========================================================
+# START DEBUG
+# ==========================================================
+
+print("=" * 80)
+print("STARTING MERGE")
+print("=" * 80)
+
+print("CESMLC_FILE:", CESMLC_FILE)
+print("CSSNG_FILE :", CSSNG_FILE)
+print("OUT_FILE   :", OUT_FILE)
+
+print("\nChecking files...")
+print("CESMLC exists:", CESMLC_FILE.exists())
+print("CSSNG exists :", CSSNG_FILE.exists())
+
+if not CESMLC_FILE.exists():
+    raise FileNotFoundError(f"CESMLC file not found: {CESMLC_FILE}")
+
+if not CSSNG_FILE.exists():
+    raise FileNotFoundError(f"CSSNG file not found: {CSSNG_FILE}")
+
+
+# ==========================================================
+# READ CESMLC
+# ==========================================================
+
+print("\n" + "=" * 80)
+print("READING CESMLC FILE")
+print("=" * 80)
+
+ces = pd.read_csv(CESMLC_FILE, dtype=str, low_memory=False)
+print("CESMLC raw shape:", ces.shape)
+print("CESMLC raw columns:", list(ces.columns))
+
+ces = clean_columns(ces)
+print("CESMLC cleaned columns:", list(ces.columns))
+
+ces_ecgi_col = find_col(ces, "ECGI")
+problem_col = find_col(ces, "PRIMARY_PROBLEM_CLASS")
+
+print("CESMLC ECGI column:", ces_ecgi_col)
+print("Insert after column:", problem_col)
+
+ces[ces_ecgi_col] = clean_text(ces[ces_ecgi_col])
+
+needed_ecgis = set(ces[ces_ecgi_col].dropna().astype(str))
+
+print("CESMLC rows:", len(ces))
+print("Unique CESMLC ECGIs:", len(needed_ecgis))
+print("Sample CESMLC ECGIs:", list(needed_ecgis)[:10])
+
+
+# ==========================================================
+# READ CSSNG IN CHUNKS
+# ==========================================================
+
+print("\n" + "=" * 80)
+print("READING CSSNG FILE IN CHUNKS")
+print("=" * 80)
+
+parts = []
+total_cssng_rows = 0
+total_matched_rows = 0
+chunk_num = 0
+first_chunk_done = False
+
+for chunk in pd.read_csv(
+    CSSNG_FILE,
+    dtype=str,
+    chunksize=CHUNK_SIZE,
+    low_memory=False,
+    skipinitialspace=True
+):
+    chunk_num += 1
+    total_cssng_rows += len(chunk)
+
+    print("\n--- CSSNG CHUNK", chunk_num, "---")
+    print("Raw chunk shape:", chunk.shape)
+
+    if not first_chunk_done:
+        print("Raw CSSNG columns:", list(chunk.columns))
+
+    chunk = clean_columns(chunk)
+
+    if not first_chunk_done:
+        print("Cleaned CSSNG columns:", list(chunk.columns))
+
+    css_pull_col = find_col(chunk, "PULLDATE")
+    css_ecgi_col = find_col(chunk, "ECGI")
+    css_site_col = find_col(chunk, "SITE_TYPE")
+
+    if not first_chunk_done:
+        print("CSSNG PULLDATE column:", css_pull_col)
+        print("CSSNG ECGI column    :", css_ecgi_col)
+        print("CSSNG SITE_TYPE column:", css_site_col)
+
+        print("\nSample CSSNG rows before filtering:")
+        print(chunk[[css_pull_col, css_ecgi_col, css_site_col]].head(10).to_string(index=False))
+
+        first_chunk_done = True
+
+    small = chunk[[css_pull_col, css_ecgi_col, css_site_col]].copy()
+    small = small.rename(
+        columns={
+            css_pull_col: "PULLDATE",
+            css_ecgi_col: "ECGI",
+            css_site_col: "SITE_TYPE"
+        }
+    )
+
+    small["ECGI"] = clean_text(small["ECGI"])
+    small["SITE_TYPE"] = clean_text(small["SITE_TYPE"])
+
+    before_filter = len(small)
+    small = small[small["ECGI"].isin(needed_ecgis)]
+    after_filter = len(small)
+
+    total_matched_rows += after_filter
+
+    print("Rows before ECGI filter:", before_filter)
+    print("Rows matched this chunk:", after_filter)
+
+    if after_filter > 0:
+        print("Sample matched rows:")
+        print(small[["PULLDATE", "ECGI", "SITE_TYPE"]].head(10).to_string(index=False))
+        parts.append(small)
+
+print("\n" + "=" * 80)
+print("CSSNG READ SUMMARY")
+print("=" * 80)
+
+print("Total CSSNG chunks read:", chunk_num)
+print("Total CSSNG rows read:", total_cssng_rows)
+print("Total CSSNG matched rows:", total_matched_rows)
+
+
+# ==========================================================
+# BUILD ECGI -> SITE_TYPE MAP
+# ==========================================================
+
+print("\n" + "=" * 80)
+print("BUILDING ECGI TO SITE_TYPE MAP")
+print("=" * 80)
+
+if parts:
+    cssng = pd.concat(parts, ignore_index=True)
+
+    print("Matched CSSNG combined shape:", cssng.shape)
+    print("Matched CSSNG null SITE_TYPE before drop:", cssng["SITE_TYPE"].isna().sum())
+
+    cssng = cssng.dropna(subset=["ECGI", "SITE_TYPE"])
+
+    print("Matched CSSNG shape after dropping null ECGI/SITE_TYPE:", cssng.shape)
+
+    cssng["PULLDATE_DT"] = pd.to_datetime(cssng["PULLDATE"], errors="coerce")
+
+    print("Bad PULLDATE rows:", cssng["PULLDATE_DT"].isna().sum())
+
+    cssng = cssng.sort_values(["ECGI", "PULLDATE_DT"])
+
+    print("Unique matched ECGIs in CSSNG:", cssng["ECGI"].nunique())
+
+    print("\nTop SITE_TYPE values:")
+    print(cssng["SITE_TYPE"].value_counts(dropna=False).head(20).to_string())
+
+    site_map = (
+        cssng
+        .drop_duplicates(subset=["ECGI"], keep="last")
+        .set_index("ECGI")["SITE_TYPE"]
+    )
+
+    print("Final ECGI -> SITE_TYPE map size:", len(site_map))
+
+else:
+    print("WARNING: No matching ECGIs found between CESMLC and CSSNG.")
+    site_map = pd.Series(dtype=str)
+
+
+# ==========================================================
+# INSERT SITE_TYPE BESIDE PRIMARY_PROBLEM_CLASS
+# ==========================================================
+
+print("\n" + "=" * 80)
+print("INSERTING SITE_TYPE INTO CESMLC")
+print("=" * 80)
+
+site_type_values = ces[ces_ecgi_col].map(site_map)
+
+if "SITE_TYPE" in ces.columns:
+    print("Existing SITE_TYPE column found in CESMLC. Removing old one.")
+    ces = ces.drop(columns=["SITE_TYPE"])
+
+insert_pos = ces.columns.get_loc(problem_col) + 1
+ces.insert(insert_pos, "SITE_TYPE", site_type_values)
+
+print("Inserted SITE_TYPE at column position:", insert_pos)
+print("Matched SITE_TYPE:", ces["SITE_TYPE"].notna().sum())
+print("Missing SITE_TYPE:", ces["SITE_TYPE"].isna().sum())
+
+print("\nSample final rows:")
+print(
+    ces[[ces_ecgi_col, problem_col, "SITE_TYPE"]]
+    .head(20)
+    .to_string(index=False)
+)
+
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+print("\n" + "=" * 80)
+print("EXPORTING OUTPUT")
+print("=" * 80)
+
+ces.to_csv(OUT_FILE, index=False)
+
+print("Done.")
+print("Output file:", OUT_FILE)
+print("Final rows:", len(ces))
+print("Final columns:", len(ces.columns))
+print("=" * 80)
