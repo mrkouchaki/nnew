@@ -1,0 +1,72 @@
+import pandas as pd
+from pathlib import Path
+
+CESMLC_FILE = Path(r"C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection_2\cesmlc_v6_ecgi_incident_summary_top.csv")
+CSSNG_FILE  = Path(r"C:\Temp\cssng_lte_data_hist_30d.csv")
+
+OUT_FILE = CESMLC_FILE.with_name("cesmlc_v6_ecgi_incident_summary_top_with_site_type.csv")
+
+def find_col(df, name):
+    for c in df.columns:
+        if c.strip().upper() == name.upper():
+            return c
+    raise ValueError(f"Column not found: {name}")
+
+# Read CESMLC
+ces = pd.read_csv(CESMLC_FILE, dtype=str)
+
+ces_ecgi_col = find_col(ces, "ECGI")
+problem_col = find_col(ces, "PRIMARY_PROBLEM_CLASS")
+
+ces[ces_ecgi_col] = ces[ces_ecgi_col].astype(str).str.strip()
+needed_ecgis = set(ces[ces_ecgi_col].dropna())
+
+# Read CSSNG only for matching ECGIs
+parts = []
+
+for chunk in pd.read_csv(
+    CSSNG_FILE,
+    dtype=str,
+    usecols=["PULLDATE", "ECGI", "SITE_TYPE"],
+    chunksize=500000
+):
+    chunk["ECGI"] = chunk["ECGI"].astype(str).str.strip()
+    chunk = chunk[chunk["ECGI"].isin(needed_ecgis)]
+
+    if not chunk.empty:
+        parts.append(chunk)
+
+if parts:
+    cssng = pd.concat(parts, ignore_index=True)
+
+    # If same ECGI appears many times, use latest PULLDATE
+    cssng["PULLDATE"] = pd.to_datetime(cssng["PULLDATE"], errors="coerce")
+    cssng = cssng.sort_values("PULLDATE")
+
+    site_map = (
+        cssng
+        .drop_duplicates(subset=["ECGI"], keep="last")
+        .set_index("ECGI")["SITE_TYPE"]
+    )
+else:
+    site_map = pd.Series(dtype=str)
+
+# Create SITE_TYPE values
+site_type_values = ces[ces_ecgi_col].map(site_map)
+
+# If SITE_TYPE already exists, remove it first
+if "SITE_TYPE" in ces.columns:
+    ces = ces.drop(columns=["SITE_TYPE"])
+
+# Insert SITE_TYPE right after PRIMARY_PROBLEM_CLASS
+insert_pos = ces.columns.get_loc(problem_col) + 1
+ces.insert(insert_pos, "SITE_TYPE", site_type_values)
+
+# Export
+ces.to_csv(OUT_FILE, index=False)
+
+print("Done.")
+print("Output file:", OUT_FILE)
+print("Rows:", len(ces))
+print("Matched SITE_TYPE:", ces["SITE_TYPE"].notna().sum())
+print("Missing SITE_TYPE:", ces["SITE_TYPE"].isna().sum())
