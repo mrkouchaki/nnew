@@ -1,0 +1,306 @@
+import pandas as pd
+from pathlib import Path
+
+# ==========================================================
+# FILE PATHS
+# ==========================================================
+
+CESMLC_FILE = Path(
+    r"C:\temp\cesmlc_v6_2_fixed_seed_akr3aesme01_30d_outputs\cesmlc_v6_ecgi_incident_summary_top.csv"
+)
+
+CSSNG_FILE = Path(
+    r"C:\temp\cssng_lte_data_hist_35d.csv"
+)
+
+OUT_SUMMARY_FILE = CESMLC_FILE.with_name(
+    "cesmlc_v6_ecgi_incident_summary_top_with_site_type.csv"
+)
+
+OUT_LOOKUP_FILE = CESMLC_FILE.with_name(
+    "cssng_latest_site_type_lat_lon_for_cesmlc_ecgis.csv"
+)
+
+CHUNK_SIZE = 500000
+
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def clean_columns(df):
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace('"', "", regex=False)
+        .str.strip()
+        .str.upper()
+    )
+    return df
+
+
+def clean_text(s):
+    s = (
+        s.astype("string")
+        .str.replace('"', "", regex=False)
+        .str.strip()
+    )
+    s = s.mask(s.str.upper().isin(["", "NAN", "NONE", "NULL"]))
+    return s
+
+
+def find_col(df, col_name):
+    target = col_name.upper()
+    for c in df.columns:
+        if c.strip().upper() == target:
+            return c
+
+    print("Column not found:", col_name)
+    print("Available columns:", list(df.columns))
+    raise ValueError(f"Missing column: {col_name}")
+
+
+def latest_not_null(g, value_col):
+    valid = g[g[value_col].notna()].copy()
+
+    if valid.empty:
+        return pd.NA, pd.NA
+
+    row = valid.iloc[-1]
+    return row[value_col], row["PULLDATE"]
+
+
+# ==========================================================
+# START
+# ==========================================================
+
+print("=" * 80)
+print("STARTING MERGE")
+print("=" * 80)
+
+print("CESMLC_FILE:", CESMLC_FILE)
+print("CSSNG_FILE :", CSSNG_FILE)
+
+if not CESMLC_FILE.exists():
+    raise FileNotFoundError(CESMLC_FILE)
+
+if not CSSNG_FILE.exists():
+    raise FileNotFoundError(CSSNG_FILE)
+
+
+# ==========================================================
+# READ CESMLC SUMMARY
+# ==========================================================
+
+print("\nReading CESMLC summary...")
+
+ces = pd.read_csv(CESMLC_FILE, dtype=str, low_memory=False)
+ces = clean_columns(ces)
+
+print("CESMLC shape:", ces.shape)
+print("CESMLC columns:", list(ces.columns))
+
+ces_ecgi_col = find_col(ces, "ECGI")
+problem_col = find_col(ces, "PRIMARY_PROBLEM_CLASS")
+
+ces[ces_ecgi_col] = clean_text(ces[ces_ecgi_col])
+
+needed_ecgis_df = (
+    ces[[ces_ecgi_col]]
+    .dropna()
+    .drop_duplicates()
+    .rename(columns={ces_ecgi_col: "ECGI"})
+)
+
+needed_ecgis = set(needed_ecgis_df["ECGI"])
+
+print("CESMLC rows:", len(ces))
+print("Unique CESMLC ECGIs:", len(needed_ecgis))
+
+
+# ==========================================================
+# READ CSSNG HISTORY
+# ==========================================================
+
+print("\nReading CSSNG history...")
+
+parts = []
+chunk_count = 0
+total_rows = 0
+total_matched = 0
+
+for chunk in pd.read_csv(
+    CSSNG_FILE,
+    dtype=str,
+    chunksize=CHUNK_SIZE,
+    low_memory=False,
+    skipinitialspace=True
+):
+    chunk_count += 1
+    total_rows += len(chunk)
+
+    chunk = clean_columns(chunk)
+
+    if chunk_count == 1:
+        print("\nCSSNG cleaned columns:", list(chunk.columns))
+        print("\nIMPORTANT MAPPING USED:")
+        print("SITE_TYPE      <- RBSS_LATITUDE")
+        print("RBSS_LATITUDE  <- RBSS_LONGITUDE")
+        print("RBSS_LONGITUDE <- SITE_TYPE")
+
+    pull_col = find_col(chunk, "PULLDATE")
+    ecgi_col = find_col(chunk, "ECGI")
+
+    # ======================================================
+    # IMPORTANT: CSSNG CSV COLUMNS ARE SHIFTED
+    # ======================================================
+    real_site_type_col = find_col(chunk, "RBSS_LATITUDE")
+    real_lat_col = find_col(chunk, "RBSS_LONGITUDE")
+    real_lon_col = find_col(chunk, "SITE_TYPE")
+
+    small = chunk[
+        [
+            pull_col,
+            ecgi_col,
+            real_site_type_col,
+            real_lat_col,
+            real_lon_col,
+        ]
+    ].copy()
+
+    small = small.rename(
+        columns={
+            pull_col: "PULLDATE",
+            ecgi_col: "ECGI",
+            real_site_type_col: "SITE_TYPE",
+            real_lat_col: "RBSS_LATITUDE",
+            real_lon_col: "RBSS_LONGITUDE",
+        }
+    )
+
+    small["ECGI"] = clean_text(small["ECGI"])
+    small["SITE_TYPE"] = clean_text(small["SITE_TYPE"])
+    small["RBSS_LATITUDE"] = clean_text(small["RBSS_LATITUDE"])
+    small["RBSS_LONGITUDE"] = clean_text(small["RBSS_LONGITUDE"])
+
+    small = small[small["ECGI"].isin(needed_ecgis)]
+
+    matched = len(small)
+    total_matched += matched
+
+    if matched > 0:
+        parts.append(small)
+
+    if chunk_count == 1 or chunk_count % 10 == 0:
+        print(
+            f"Chunk {chunk_count}: rows={len(chunk):,}, "
+            f"matched={matched:,}, total matched={total_matched:,}"
+        )
+
+print("\nCSSNG read finished.")
+print("Total chunks:", chunk_count)
+print("Total CSSNG rows:", total_rows)
+print("Total matched rows:", total_matched)
+
+
+# ==========================================================
+# BUILD LATEST NON-NULL LOOKUP PER ECGI
+# ==========================================================
+
+print("\nBuilding latest non-null values per ECGI...")
+
+if parts:
+    cssng = pd.concat(parts, ignore_index=True)
+
+    cssng["PULLDATE_DT"] = pd.to_datetime(cssng["PULLDATE"], errors="coerce")
+
+    cssng = cssng.sort_values(
+        ["ECGI", "PULLDATE_DT"],
+        ascending=[True, True],
+        na_position="first"
+    )
+
+    records = []
+
+    for ecgi, g in cssng.groupby("ECGI", sort=False):
+        site_type, site_type_date = latest_not_null(g, "SITE_TYPE")
+        lat, lat_date = latest_not_null(g, "RBSS_LATITUDE")
+        lon, lon_date = latest_not_null(g, "RBSS_LONGITUDE")
+
+        records.append(
+            {
+                "ECGI": ecgi,
+                "SITE_TYPE": site_type,
+                "RBSS_LATITUDE": lat,
+                "RBSS_LONGITUDE": lon,
+                "SITE_TYPE_PULLDATE": site_type_date,
+                "LATITUDE_PULLDATE": lat_date,
+                "LONGITUDE_PULLDATE": lon_date,
+                "CSSNG_ROWS_FOUND": len(g),
+            }
+        )
+
+    lookup_found = pd.DataFrame(records)
+
+else:
+    lookup_found = pd.DataFrame(
+        columns=[
+            "ECGI",
+            "SITE_TYPE",
+            "RBSS_LATITUDE",
+            "RBSS_LONGITUDE",
+            "SITE_TYPE_PULLDATE",
+            "LATITUDE_PULLDATE",
+            "LONGITUDE_PULLDATE",
+            "CSSNG_ROWS_FOUND",
+        ]
+    )
+
+lookup = needed_ecgis_df.merge(lookup_found, on="ECGI", how="left")
+
+print("Lookup rows:", len(lookup))
+print("Matched SITE_TYPE:", lookup["SITE_TYPE"].notna().sum())
+print("Matched RBSS_LATITUDE:", lookup["RBSS_LATITUDE"].notna().sum())
+print("Matched RBSS_LONGITUDE:", lookup["RBSS_LONGITUDE"].notna().sum())
+
+print("\nSample lookup:")
+print(
+    lookup[
+        ["ECGI", "SITE_TYPE", "RBSS_LATITUDE", "RBSS_LONGITUDE"]
+    ].head(20).to_string(index=False)
+)
+
+
+# ==========================================================
+# ADD SITE_TYPE TO CESMLC SUMMARY
+# ==========================================================
+
+print("\nAdding SITE_TYPE beside PRIMARY_PROBLEM_CLASS...")
+
+site_map = lookup.set_index("ECGI")["SITE_TYPE"]
+site_type_values = ces[ces_ecgi_col].map(site_map)
+
+if "SITE_TYPE" in ces.columns:
+    ces = ces.drop(columns=["SITE_TYPE"])
+
+insert_pos = ces.columns.get_loc(problem_col) + 1
+ces.insert(insert_pos, "SITE_TYPE", site_type_values)
+
+print("Final CESMLC rows:", len(ces))
+print("Final matched SITE_TYPE:", ces["SITE_TYPE"].notna().sum())
+print("Final missing SITE_TYPE:", ces["SITE_TYPE"].isna().sum())
+
+
+# ==========================================================
+# EXPORT
+# ==========================================================
+
+ces.to_csv(OUT_SUMMARY_FILE, index=False)
+lookup.to_csv(OUT_LOOKUP_FILE, index=False)
+
+print("\nDONE.")
+print("Main output:")
+print(OUT_SUMMARY_FILE)
+
+print("\nSeparate lookup output:")
+print(OUT_LOOKUP_FILE)
