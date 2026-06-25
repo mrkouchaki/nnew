@@ -1,0 +1,441 @@
+import pandas as pd
+from pathlib import Path
+
+# ==========================================================
+# SETTINGS
+# ==========================================================
+
+DATE_WINDOW_DAYS = 15
+CHUNK_SIZE = 500000
+
+BASE_DIR = Path(r"C:\temp\cesmlc_v6_2_fixed_seed_akr3aesme01_30d_outputs")
+
+CESMLC_FILE = BASE_DIR / "cesmlc_v6_ecgi_incident_summary_top.csv"
+
+CSSNG_FILE = Path(r"C:\temp\cssng_lte_data_hist_35d.csv")
+
+AUDIT_FILE = BASE_DIR / "enmt_cesmlc_lte_audit_p_akr3aesme01_30d_withDB_v2.csv"
+
+OUT_FILE = BASE_DIR / "cesmlc_ecgi_15d_cssng_audit_features.csv"
+
+
+# ==========================================================
+# HELPERS
+# ==========================================================
+
+def clean_columns(df):
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\ufeff", "", regex=False)
+        .str.replace('"', "", regex=False)
+        .str.strip()
+        .str.upper()
+    )
+    return df
+
+
+def clean_text(s):
+    s = (
+        s.astype("string")
+        .str.replace('"', "", regex=False)
+        .str.strip()
+    )
+    s = s.mask(s.str.upper().isin(["", "NAN", "NONE", "NULL"]))
+    return s
+
+
+def get_header_map(path):
+    header = pd.read_csv(path, nrows=0)
+    raw_cols = list(header.columns)
+
+    mapping = {}
+    for raw in raw_cols:
+        clean = (
+            str(raw)
+            .replace("\ufeff", "")
+            .replace('"', "")
+            .strip()
+            .upper()
+        )
+        mapping[clean] = raw
+
+    return mapping, raw_cols
+
+
+def raw_col(path, possible_names):
+    mapping, raw_cols = get_header_map(path)
+
+    for name in possible_names:
+        key = name.strip().upper()
+        if key in mapping:
+            return mapping[key]
+
+    print("\nCOLUMN NOT FOUND")
+    print("File:", path)
+    print("Tried:", possible_names)
+    print("Available columns:")
+    for c in raw_cols:
+        print("  -", repr(c))
+
+    raise ValueError(f"Column not found: {possible_names}")
+
+
+def latest_not_null(g, col):
+    valid = g[g[col].notna()]
+    if valid.empty:
+        return pd.NA
+    return valid.iloc[-1][col]
+
+
+# ==========================================================
+# CHECK FILES
+# ==========================================================
+
+print("=" * 80)
+print("STARTING 15-DAY ECGI CONTEXT BUILD")
+print("=" * 80)
+
+for f in [CESMLC_FILE, CSSNG_FILE, AUDIT_FILE]:
+    print("Checking:", f)
+    if not f.exists():
+        raise FileNotFoundError(f)
+
+print("All files found.")
+
+
+# ==========================================================
+# 1) READ CESMLC SUMMARY: ECGI + PRIMARY_PROBLEM_CLASS
+# ==========================================================
+
+print("\nReading CESMLC summary...")
+
+ces = pd.read_csv(CESMLC_FILE, dtype=str, low_memory=False)
+ces = clean_columns(ces)
+
+ces_ecgi_col = "ECGI"
+problem_col = "PRIMARY_PROBLEM_CLASS"
+
+if ces_ecgi_col not in ces.columns:
+    raise ValueError("ECGI column not found in CESMLC file.")
+
+if problem_col not in ces.columns:
+    raise ValueError("PRIMARY_PROBLEM_CLASS column not found in CESMLC file.")
+
+ces["ECGI"] = clean_text(ces["ECGI"])
+ces["PRIMARY_PROBLEM_CLASS"] = clean_text(ces["PRIMARY_PROBLEM_CLASS"])
+
+# One row per ECGI
+ces_key = (
+    ces[["ECGI", "PRIMARY_PROBLEM_CLASS"]]
+    .dropna(subset=["ECGI"])
+    .drop_duplicates(subset=["ECGI"], keep="first")
+)
+
+needed_ecgis = set(ces_key["ECGI"])
+
+print("CESMLC rows:", len(ces))
+print("Unique CESMLC ECGIs:", len(needed_ecgis))
+print("Sample ECGIs:", list(needed_ecgis)[:10])
+
+
+# ==========================================================
+# 2) READ CSSNG: LATEST NON-NULL SITE_TYPE / RBSS_LAT / RBSS_LON
+# ==========================================================
+
+print("\nReading CSSNG file...")
+
+css_parts = []
+css_chunk_count = 0
+css_total_rows = 0
+css_total_matched = 0
+
+for chunk in pd.read_csv(
+    CSSNG_FILE,
+    dtype=str,
+    chunksize=CHUNK_SIZE,
+    low_memory=False,
+    skipinitialspace=True
+):
+    css_chunk_count += 1
+    css_total_rows += len(chunk)
+
+    chunk = clean_columns(chunk)
+
+    if css_chunk_count == 1:
+        print("CSSNG columns:", list(chunk.columns))
+        print("Using corrected CSSNG mapping:")
+        print("  SITE_TYPE      <- RBSS_LATITUDE")
+        print("  RBSS_LATITUDE  <- RBSS_LONGITUDE")
+        print("  RBSS_LONGITUDE <- SITE_TYPE")
+
+    # Current CSSNG CSV has wrong header positions
+    small = chunk[
+        [
+            "PULLDATE",
+            "ECGI",
+            "RBSS_LATITUDE",
+            "RBSS_LONGITUDE",
+            "SITE_TYPE",
+        ]
+    ].copy()
+
+    small = small.rename(
+        columns={
+            "PULLDATE": "PULLDATE",
+            "ECGI": "ECGI",
+            "RBSS_LATITUDE": "SITE_TYPE",
+            "RBSS_LONGITUDE": "RBSS_LATITUDE",
+            "SITE_TYPE": "RBSS_LONGITUDE",
+        }
+    )
+
+    small["ECGI"] = clean_text(small["ECGI"])
+    small["SITE_TYPE"] = clean_text(small["SITE_TYPE"])
+    small["RBSS_LATITUDE"] = clean_text(small["RBSS_LATITUDE"])
+    small["RBSS_LONGITUDE"] = clean_text(small["RBSS_LONGITUDE"])
+
+    small = small[small["ECGI"].isin(needed_ecgis)]
+
+    css_total_matched += len(small)
+
+    if not small.empty:
+        css_parts.append(small)
+
+    if css_chunk_count == 1 or css_chunk_count % 10 == 0:
+        print(
+            f"CSSNG chunk {css_chunk_count}: "
+            f"rows={len(chunk):,}, matched={len(small):,}, "
+            f"total matched={css_total_matched:,}"
+        )
+
+if css_parts:
+    cssng = pd.concat(css_parts, ignore_index=True)
+    cssng["PULLDATE_DT"] = pd.to_datetime(cssng["PULLDATE"], errors="coerce")
+
+    cssng = cssng.sort_values(
+        ["ECGI", "PULLDATE_DT"],
+        ascending=[True, True],
+        na_position="first"
+    )
+
+    css_records = []
+
+    for ecgi, g in cssng.groupby("ECGI", sort=False):
+        css_records.append(
+            {
+                "ECGI": ecgi,
+                "RBSS_LATITUDE": latest_not_null(g, "RBSS_LATITUDE"),
+                "RBSS_LONGITUDE": latest_not_null(g, "RBSS_LONGITUDE"),
+                "SITE_TYPE": latest_not_null(g, "SITE_TYPE"),
+            }
+        )
+
+    css_lookup = pd.DataFrame(css_records)
+
+else:
+    css_lookup = pd.DataFrame(
+        columns=["ECGI", "RBSS_LATITUDE", "RBSS_LONGITUDE", "SITE_TYPE"]
+    )
+
+print("CSSNG lookup rows:", len(css_lookup))
+print("Matched CSSNG SITE_TYPE:", css_lookup["SITE_TYPE"].notna().sum())
+print("Matched CSSNG RBSS_LATITUDE:", css_lookup["RBSS_LATITUDE"].notna().sum())
+print("Matched CSSNG RBSS_LONGITUDE:", css_lookup["RBSS_LONGITUDE"].notna().sum())
+
+
+# ==========================================================
+# 3) FIND LATEST AUDIT DATE, THEN KEEP LAST 15 DAYS
+# ==========================================================
+
+print("\nFinding latest ENMT_LOAD_DATE in audit file...")
+
+audit_date_raw = raw_col(AUDIT_FILE, ["ENMT_LOAD_DATE"])
+audit_ecgi_raw = raw_col(AUDIT_FILE, ["ECGI", "IECGI"])
+
+max_date = None
+
+for chunk in pd.read_csv(
+    AUDIT_FILE,
+    dtype=str,
+    usecols=[audit_date_raw],
+    chunksize=CHUNK_SIZE,
+    low_memory=False
+):
+    d = pd.to_datetime(chunk[audit_date_raw], errors="coerce")
+    chunk_max = d.max()
+
+    if pd.notna(chunk_max):
+        if max_date is None or chunk_max > max_date:
+            max_date = chunk_max
+
+if max_date is None:
+    raise ValueError("Could not parse ENMT_LOAD_DATE from audit file.")
+
+max_date = max_date.normalize()
+start_date = max_date - pd.Timedelta(days=DATE_WINDOW_DAYS - 1)
+
+print("Latest audit date:", max_date.date())
+print("Start date:", start_date.date())
+print("Date window days:", DATE_WINDOW_DAYS)
+
+
+# ==========================================================
+# 4) READ AUDIT FEATURES FOR CESMLC ECGIS AND LAST 15 DAYS
+# ==========================================================
+
+print("\nReading audit features...")
+
+audit_cols_needed = {
+    "ENMT_LOAD_DATE": ["ENMT_LOAD_DATE"],
+    "ECGI": ["ECGI", "IECGI"],
+    "ANTENNALAT": ["ANTENNALAT", "ANTENNA_LAT", "ANTENNA_LATITUDE"],
+    "ANTENNALON": ["ANTENNALON", "ANTENNA_LON", "ANTENNA_LONGITUDE"],
+    "GEOTYPE": ["GEOTYPE"],
+    "PHYSICALCELLID": ["PHYSICALCELLID"],
+    "ANTENNAHORIZONTALRANGE": ["ANTENNAHORIZONTALRANGE"],
+    "ANTENNAOPENING": ["ANTENNAOPENING"],
+    "ANTENNABASEALTITUDE": ["ANTENNABASEALTITUDE"],
+}
+
+audit_raw_cols = {}
+for final_name, possible in audit_cols_needed.items():
+    audit_raw_cols[final_name] = raw_col(AUDIT_FILE, possible)
+
+usecols = list(dict.fromkeys(audit_raw_cols.values()))
+
+print("Audit columns used:")
+for final_name, raw_name in audit_raw_cols.items():
+    print(f"  {final_name} <- {raw_name}")
+
+audit_parts = []
+audit_chunk_count = 0
+audit_total_rows = 0
+audit_total_matched = 0
+
+for chunk in pd.read_csv(
+    AUDIT_FILE,
+    dtype=str,
+    usecols=usecols,
+    chunksize=CHUNK_SIZE,
+    low_memory=False,
+    skipinitialspace=True
+):
+    audit_chunk_count += 1
+    audit_total_rows += len(chunk)
+
+    rename_map = {raw: final for final, raw in audit_raw_cols.items()}
+    chunk = chunk.rename(columns=rename_map)
+    chunk = clean_columns(chunk)
+
+    chunk["ECGI"] = clean_text(chunk["ECGI"])
+    chunk["ENMT_LOAD_DATE_DT"] = pd.to_datetime(chunk["ENMT_LOAD_DATE"], errors="coerce")
+
+    chunk = chunk[
+        (chunk["ECGI"].isin(needed_ecgis)) &
+        (chunk["ENMT_LOAD_DATE_DT"] >= start_date) &
+        (chunk["ENMT_LOAD_DATE_DT"] <= max_date)
+    ].copy()
+
+    audit_total_matched += len(chunk)
+
+    if not chunk.empty:
+        for c in [
+            "ANTENNALAT",
+            "ANTENNALON",
+            "GEOTYPE",
+            "PHYSICALCELLID",
+            "ANTENNAHORIZONTALRANGE",
+            "ANTENNAOPENING",
+            "ANTENNABASEALTITUDE",
+        ]:
+            chunk[c] = clean_text(chunk[c])
+
+        chunk["ENMT_LOAD_DATE"] = chunk["ENMT_LOAD_DATE_DT"].dt.strftime("%Y-%m-%d")
+
+        audit_parts.append(chunk)
+
+    if audit_chunk_count == 1 or audit_chunk_count % 10 == 0:
+        print(
+            f"Audit chunk {audit_chunk_count}: "
+            f"rows={len(chunk):,}, total matched={audit_total_matched:,}"
+        )
+
+if audit_parts:
+    audit = pd.concat(audit_parts, ignore_index=True)
+else:
+    audit = pd.DataFrame(
+        columns=[
+            "ECGI",
+            "ENMT_LOAD_DATE",
+            "ANTENNALAT",
+            "ANTENNALON",
+            "GEOTYPE",
+            "PHYSICALCELLID",
+            "ANTENNAHORIZONTALRANGE",
+            "ANTENNAOPENING",
+            "ANTENNABASEALTITUDE",
+        ]
+    )
+
+print("Audit matched rows:", len(audit))
+
+
+# ==========================================================
+# 5) ONE ROW PER ECGI PER DATE
+# ==========================================================
+
+print("\nDeduplicating audit to one row per ECGI per ENMT_LOAD_DATE...")
+
+audit = audit.sort_values(["ECGI", "ENMT_LOAD_DATE"])
+audit = audit.drop_duplicates(subset=["ECGI", "ENMT_LOAD_DATE"], keep="last")
+
+print("Audit rows after dedupe:", len(audit))
+
+
+# ==========================================================
+# 6) MERGE EVERYTHING
+# ==========================================================
+
+print("\nMerging CESMLC + CSSNG + AUDIT...")
+
+out = audit.merge(ces_key, on="ECGI", how="left")
+out = out.merge(css_lookup, on="ECGI", how="left")
+
+final_cols = [
+    "ECGI",
+    "ENMT_LOAD_DATE",
+    "PRIMARY_PROBLEM_CLASS",
+    "RBSS_LATITUDE",
+    "RBSS_LONGITUDE",
+    "SITE_TYPE",
+    "ANTENNALAT",
+    "ANTENNALON",
+    "GEOTYPE",
+    "PHYSICALCELLID",
+    "ANTENNAHORIZONTALRANGE",
+    "ANTENNAOPENING",
+    "ANTENNABASEALTITUDE",
+]
+
+out = out[final_cols]
+
+out = out.sort_values(["ECGI", "ENMT_LOAD_DATE"])
+
+
+# ==========================================================
+# 7) EXPORT
+# ==========================================================
+
+out.to_csv(OUT_FILE, index=False)
+
+print("\nDONE.")
+print("Output file:", OUT_FILE)
+print("Final rows:", len(out))
+print("Unique ECGIs in output:", out["ECGI"].nunique())
+print("Matched PRIMARY_PROBLEM_CLASS:", out["PRIMARY_PROBLEM_CLASS"].notna().sum())
+print("Matched SITE_TYPE:", out["SITE_TYPE"].notna().sum())
+print("Matched RBSS_LATITUDE:", out["RBSS_LATITUDE"].notna().sum())
+print("Matched RBSS_LONGITUDE:", out["RBSS_LONGITUDE"].notna().sum())
+
+print("\nSample output:")
+print(out.head(20).to_string(index=False))
